@@ -1,5 +1,7 @@
 # CHMCache
 
+[![](https://jitpack.io/v/com.gitee.wb04307201/CHMCache.svg)](https://jitpack.io/#com.gitee.wb04307201/CHMCache)
+
 一个基于 `ConcurrentHashMap` 和 LRU 策略的高性能缓存实现，支持自动过期、大小限制、LRU 淘汰和后台清理等特性。
 
 ## 特性
@@ -9,6 +11,26 @@
 - **LRU淘汰**: 当缓存达到最大容量时，自动移除最近最少使用的项
 - **后台清理**: 定时清理线程自动处理过期和多余的缓存项
 - **统计监控**: 提供命中率、清理次数等监控指标
+
+## 
+
+### 增加 JitPack 仓库
+```xml
+<repositories>
+    <repository>
+        <id>jitpack.io</id>
+        <url>https://jitpack.io</url>
+    </repository>
+</repositories>
+```
+### 引入jar
+```xml
+<dependency>
+    <groupId>com.gitee.wb04307201</groupId>
+    <artifactId>CHMCache</artifactId>
+    <version>1.0.0</version>
+</dependency>
+```
 
 ## 使用方法
 
