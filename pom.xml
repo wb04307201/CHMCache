@@ -8,7 +8,21 @@
     <packaging>jar</packaging>
 
     <name>CHMCache</name>
-    <url>http://maven.apache.org</url>
+
+    <url>
+        https://gitee.com/wb04307201/CHMCache
+    </url>
+    <licenses>
+        <license>
+            <name>The Apache Software License, Version 2.0</name>
+            <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+        </license>
+    </licenses>
+    <developers>
+        <developer>
+            <name>wubo</name>
+        </developer>
+    </developers>
 
     <properties>
         <maven.compiler.source>17</maven.compiler.source>
