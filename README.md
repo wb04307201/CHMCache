@@ -12,7 +12,9 @@
 - **后台清理**: 定时清理线程自动处理过期和多余的缓存项
 - **统计监控**: 提供命中率、清理次数等监控指标
 
-## 
+---
+
+## 引入
 
 ### 增加 JitPack 仓库
 ```xml
@@ -23,7 +25,7 @@
     </repository>
 </repositories>
 ```
-### 引入jar
+### 添加依赖
 ```xml
 <dependency>
     <groupId>com.gitee.wb04307201</groupId>
@@ -31,6 +33,8 @@
     <version>1.0.0</version>
 </dependency>
 ```
+
+---
 
 ## 使用方法
 
