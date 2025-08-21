@@ -1,4 +1,4 @@
-# CHMCache
+# CHMCacheCHMCache - 基于 ConcurrentHashMap 的高性能缓存实现
 
 [![](https://jitpack.io/v/com.gitee.wb04307201/CHMCache.svg)](https://jitpack.io/#com.gitee.wb04307201/CHMCache)
 
