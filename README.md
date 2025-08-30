@@ -139,7 +139,6 @@ int currentSize = metrics.getCurrentSize();    // 当前缓存大小
 ## 性能优化建议
 
 1. **合理设置缓存大小**: 根据应用内存和访问模式设置合适的 [maxSize](src/main/java/cn/wubo/cache/CHMCache.java#L25-L25)
-   
 2. **调整TTL**: 根据数据变化频率设置合适的过期时间
 3. **监控指标**: 定期检查命中率等指标，优化缓存配置
 4. **及时关闭**: 应用结束时调用 [shutdown()](src\main\java\cn\wubo\cache\CHMCache.java#L288-L298) 方法释放资源
