@@ -1,4 +1,4 @@
-# CHMCacheCHMCache - 基于 ConcurrentHashMap 的缓存实现
+# CHMCacheCHMCache - 基于ConcurrentHashMap的缓存实现
 
 一个基于 `ConcurrentHashMap` 和 LRU 策略的缓存实现，支持自动过期、大小限制、LRU 淘汰和后台清理等特性。
 
