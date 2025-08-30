@@ -40,7 +40,7 @@ public class CHMCache<K, V> {
      * 默认构造函数，使用默认的缓存大小1000和默认的 TTL 60秒
      */
     public CHMCache() {
-        this(1000, 60_000);
+        this(1000, 60_000, TimeUnit.MILLISECONDS);
     }
 
     /**
@@ -49,8 +49,18 @@ public class CHMCache<K, V> {
      * @param defaultTtlMillis 默认过期时间（毫秒）
      */
     public CHMCache(int maxSize, long defaultTtlMillis) {
+        this(maxSize, defaultTtlMillis, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * 构造函数，初始化缓存配置和数据结构
+     * @param maxSize 缓存最大大小
+     * @param defaultTtlMillis 默认过期时间（毫秒）
+     * @param unit 时间单位
+     */
+    public CHMCache(int maxSize, long defaultTtlMillis, TimeUnit unit) {
         this.maxSize = maxSize;
-        this.defaultTtlMillis = defaultTtlMillis;
+        this.defaultTtlMillis = unit.toMillis(defaultTtlMillis);
         this.ttlRandom = new Random();
         this.cacheMap = new ConcurrentHashMap<>();
         this.accessOrderMap = new LinkedHashMap<>(16, 0.75f, true); // accessOrder=true 表示按访问顺序排序
@@ -116,7 +126,7 @@ public class CHMCache<K, V> {
         try {
             int removed = 0;
             Iterator<Map.Entry<K, Long>> iterator = accessOrderMap.entrySet().iterator();
-            while (cacheMap.size() > maxSize * 0.9 && iterator.hasNext()) {
+            while (cacheMap.size() > maxSize && iterator.hasNext()) {
                 Map.Entry<K, Long> entry = iterator.next();
                 K key = entry.getKey();
                 if (cacheMap.remove(key) != null) {
@@ -156,8 +166,20 @@ public class CHMCache<K, V> {
      * @param ttlMillis 过期时间（毫秒）
      */
     public void put(K key, V value, long ttlMillis) {
-        long expireTime = System.currentTimeMillis() + ttlMillis;
-        CacheValue<V> cacheValue = new CacheValue<>(value, ttlMillis);
+        put(key, value, ttlMillis, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * 添加缓存项，指定 TTL
+     * @param key 键
+     * @param value 值
+     * @param ttlMillis 过期时间（毫秒）
+     * @param unit 时间单位
+     */
+    public void put(K key, V value, long ttlMillis, TimeUnit unit) {
+        long millis = unit.toMillis(ttlMillis);
+        long expireTime = System.currentTimeMillis() + millis;
+        CacheValue<V> cacheValue = new CacheValue<>(value, millis);
 
         // 添加到主缓存
         cacheMap.put(key, cacheValue);
@@ -277,52 +299,15 @@ public class CHMCache<K, V> {
     }
 
     /**
-     * 获取缓存命中率
-     * @return 命中率（0-1）
+     * 获取监控指标
      */
-    public double getHitRate() {
-        long total = hitCount.get() + missCount.get();
-        return total == 0 ? 0 : (double) hitCount.get() / total;
-    }
-
-    /**
-     * 获取命中次数
-     * @return 命中次数
-     */
-    public long getHitCount() {
-        return hitCount.get();
-    }
-
-    /**
-     * 获取未命中次数
-     * @return 未命中次数
-     */
-    public long getMissCount() {
-        return missCount.get();
-    }
-
-    /**
-     * 获取被淘汰的缓存项数量
-     * @return 淘汰次数
-     */
-    public long getEvictionCount() {
-        return evictionCount.get();
-    }
-
-    /**
-     * 获取平均清理耗时（毫秒）
-     * @return 平均清理耗时（毫秒）
-     */
-    public double getAverageCleanupTimeMillis() {
-        long count = cleanupTimeNanos.get();
-        return count == 0 ? 0 : (double) count / 1_000_000;
-    }
-
-    /**
-     * 获取当前缓存大小
-     * @return 当前缓存项数量
-     */
-    public int getCurrentSize() {
-        return cacheMap.size();
+    public MonitorMetrics getMetrics() {
+        return new MonitorMetrics(
+                hitCount.get(),
+                missCount.get(),
+                evictionCount.get(),
+                cleanupTimeNanos.get(),
+                cacheMap.size()
+        );
     }
 }

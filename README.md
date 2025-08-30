@@ -1,16 +1,17 @@
-# CHMCacheCHMCache - 基于 ConcurrentHashMap 的高性能缓存实现
-
-[![](https://jitpack.io/v/com.gitee.wb04307201/CHMCache.svg)](https://jitpack.io/#com.gitee.wb04307201/CHMCache)
+# CHMCacheCHMCache - 基于 ConcurrentHashMap 的缓存实现
 
 一个基于 `ConcurrentHashMap` 和 LRU 策略的高性能缓存实现，支持自动过期、大小限制、LRU 淘汰和后台清理等特性。
+
+[![](https://jitpack.io/v/com.gitee.wb04307201/CHMCache.svg)](https://jitpack.io/#com.gitee.wb04307201/CHMCache)
 
 ## 特性
 
 - **高性能**: 基于 `ConcurrentHashMap` 实现，支持高并发访问
-- **自动过期**: 支持设置缓存项的生存时间(TTL)，自动清理过期数据
-- **LRU淘汰**: 当缓存达到最大容量时，自动移除最近最少使用的项
-- **后台清理**: 定时清理线程自动处理过期和多余的缓存项
-- **统计监控**: 提供命中率、清理次数等监控指标
+- **自动过期**: 支持设置缓存项的生存时间(TTL)，自动清理过期项
+- **LRU 淘汰**: 当缓存达到最大容量时，自动移除最近最少使用的项
+- **后台清理**: 定时清理过期项，减少主线程负担
+- **线程安全**: 完整的线程安全设计，适用于多线程环境
+- **监控指标**: 提供缓存命中率、清理时间等监控数据
 
 ---
 
@@ -30,7 +31,7 @@
 <dependency>
     <groupId>com.gitee.wb04307201</groupId>
     <artifactId>CHMCache</artifactId>
-    <version>1.0.0</version>
+    <version>1.0.1</version>
 </dependency>
 ```
 
@@ -41,11 +42,16 @@
 ### 1. 创建缓存实例
 
 ```java
+import java.util.concurrent.TimeUnit;
+
 // 使用默认配置（最大容量1000，TTL 60秒）
 CHMCache<String, Object> cache = new CHMCache<>();
 
 // 自定义配置
 CHMCache<String, Object> cache = new CHMCache<>(5000, 30_000); // 最大容量5000，TTL 30秒
+
+// 自定义配置
+CHMCache<String, Object> cache = new CHMCache<>(5000, 30, TimeUnit.SECONDS); // 最大容量5000，TTL 30秒
 ```
 
 
@@ -57,6 +63,9 @@ cache.put("key1", "value1");
 
 // 指定TTL（毫秒）
 cache.put("key2", "value2", 10_000); // 10秒后过期
+
+// 指定TTL
+cache.put("key2", "value2", 10, TimeUnit.SECONDS); // 10秒后过期
 ```
 
 
@@ -86,27 +95,31 @@ String removedValue = cache.remove("key1");
 cache.shutdown();
 ```
 
+### 核心方法
 
-## 核心组件
+| 方法                                                        | 描述               |
+|-----------------------------------------------------------|------------------|
+| `void put(K key, V value)`                                | 添加缓存项，使用默认随机TTL  |
+| `void put(K key, V value, long ttlMillis)`                | 添加缓存项，指定TTL(毫秒)  |
+| `void put(K key, V value, long ttlMillis, TimeUnit unit)` | 添加缓存项，指定TTL和时间单位 |
+| `V get(K key)`                                            | 获取缓存项            |
+| `V remove(K key)`                                         | 删除缓存项            |
+| `int size()`                                              | 获取当前缓存大小         |
+| `void cleanup()`                                          | 手动触发清理过期项        |
+| `void shutdown()`                                         | 关闭缓存，停止后台清理线程    |
+| `MonitorMetrics getMetrics()`                             | 获取监控指标           |
 
-### CHMCache<K, V>
+## 监控指标
 
-主要的缓存实现类，提供完整的缓存操作接口：
-- [put(K key, V value)](src/main/java/cn/wubo/cache/CHMCache.java#L147-L149): 添加缓存项（使用随机TTL）
-- `put(K key, V value, long ttlMillis)`: 添加缓存项（指定TTL）
-- [get(K key)](src/main/java/cn/wubo/cache/CHMCache.java#L181-L206): 获取缓存项
-- [remove(K key)](src/main/java/cn/wubo/cache/CHMCache.java#L213-L220): 删除缓存项
-- [cleanup()](src/main/java/cn/wubo/cache/CHMCache.java#L225-L253): 手动清理过期项
-- [size()](src/main/java/cn/wubo/cache/CHMCache.java#L259-L261): 获取缓存大小
-- [shutdown()](src/main/java/cn/wubo/cache/CHMCache.java#L266-L276): 关闭缓存
+```java
+MonitorMetrics metrics = cache.getMetrics();
 
-### CacheValue<V>
-
-缓存值的包装类，包含实际值和过期时间信息。
-
-### DelayedItem<K>
-
-用于延迟队列的缓存项包装，实现 `Delayed` 接口，支持按过期时间排序。
+long hitCount = metrics.getHitCount();         // 命中次数
+long missCount = metrics.getMissCount();       // 未命中次数
+long evictionCount = metrics.getEvictionCount(); // 淘汰次数
+double hitRate = metrics.getHitRate();         // 命中率
+int currentSize = metrics.getCurrentSize();    // 当前缓存大小
+```
 
 ## 缓存策略
 
@@ -123,11 +136,15 @@ cache.shutdown();
 - 当缓存大小超过阈值时自动触发淘汰
 - 后台定时线程定期执行清理任务
 
-## 监控指标
+## 性能优化建议
 
-- [getHitRate()](src/main/java/cn/wubo/cache/CHMCache.java#L282-L285): 缓存命中率
-- [getHitCount()](src/main/java/cn/wubo/cache/CHMCache.java#L291-L293): 命中次数
-- [getMissCount()](src/main/java/cn/wubo/cache/CHMCache.java#L299-L301): 未命中次数
-- [getEvictionCount()](src/main/java/cn/wubo/cache/CHMCache.java#L307-L309): 淘汰次数
-- [getAverageCleanupTimeMillis()](src/main/java/cn/wubo/cache/CHMCache.java#L315-L318): 平均清理耗时
+1. **合理设置缓存大小**: 根据应用内存和访问模式设置合适的 [maxSize](file://C:\developer\IdeaProjects\CHMCache\src\main\java\cn\wubo\cache\CHMCache.java#L25-L25)
+2. **调整TTL**: 根据数据变化频率设置合适的过期时间
+3. **监控指标**: 定期检查命中率等指标，优化缓存配置
+4. **及时关闭**: 应用结束时调用 [shutdown()](file://C:\developer\IdeaProjects\CHMCache\src\main\java\cn\wubo\cache\CHMCache.java#L288-L298) 方法释放资源
 
+## 注意事项
+
+1. **线程安全**: 所有公共方法都是线程安全的
+2. **内存管理**: 缓存会自动清理过期项，但建议在应用结束时调用 [shutdown()](file://C:\developer\IdeaProjects\CHMCache\src\main\java\cn\wubo\cache\CHMCache.java#L288-L298)
+3. **LRU实现**: 当前LRU实现使用全局锁，在高并发场景下可能成为性能瓶颈
