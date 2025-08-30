@@ -1,6 +1,6 @@
 # CHMCacheCHMCache - 基于 ConcurrentHashMap 的缓存实现
 
-一个基于 `ConcurrentHashMap` 和 LRU 策略的高性能缓存实现，支持自动过期、大小限制、LRU 淘汰和后台清理等特性。
+一个基于 `ConcurrentHashMap` 和 LRU 策略的缓存实现，支持自动过期、大小限制、LRU 淘汰和后台清理等特性。
 
 [![](https://jitpack.io/v/com.gitee.wb04307201/CHMCache.svg)](https://jitpack.io/#com.gitee.wb04307201/CHMCache)
 
