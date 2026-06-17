@@ -141,4 +141,49 @@ class LoaderTest {
             cache.shutdown();
         }
     }
+
+    @Test
+    void testGetAll_HitsAndMisses() {
+        // D18 回归测试
+        CHMCache<String, String> cache = CHMCache.<String, String>newBuilder()
+                .maximumSize(10).build();
+        try {
+            cache.put("a", "1");
+            cache.put("b", "2");
+
+            java.util.Set<String> requested = new java.util.HashSet<>(java.util.Arrays.asList("a", "b", "c", "d"));
+            java.util.Map<String, String> result = cache.getAll(requested, missing -> {
+                java.util.Map<String, String> loaded = new java.util.HashMap<>();
+                loaded.put("c", "3");
+                loaded.put("d", "4");
+                return loaded;
+            });
+            assertEquals(4, result.size());
+            assertEquals("1", result.get("a"));
+            assertEquals("2", result.get("b"));
+            assertEquals("3", result.get("c"));
+            assertEquals("4", result.get("d"));
+            // 缺失的 key 应已回填到缓存
+            assertEquals("3", cache.get("c"));
+            assertEquals("4", cache.get("d"));
+        } finally {
+            cache.shutdown();
+        }
+    }
+
+    @Test
+    void testGetAll_LoaderReturnsNull() {
+        CHMCache<String, String> cache = CHMCache.<String, String>newBuilder()
+                .maximumSize(10).build();
+        try {
+            cache.put("a", "1");
+            java.util.Map<String, String> result = cache.getAll(
+                    java.util.Set.of("a", "b"),
+                    missing -> null);
+            assertEquals(1, result.size());
+            assertEquals("1", result.get("a"));
+        } finally {
+            cache.shutdown();
+        }
+    }
 }

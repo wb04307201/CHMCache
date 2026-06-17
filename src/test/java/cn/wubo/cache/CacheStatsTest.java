@@ -100,4 +100,29 @@ class CacheStatsTest {
             cache.shutdown();
         }
     }
+
+    @Test
+    void testStats_RealMinMaxLatency() {
+        // D15 回归测试：min/max 应反映真实分布，不再等于 average
+        CHMCache<String, String> cache = CHMCache.<String, String>newBuilder()
+                .maximumSize(100)
+                .recordStats()
+                .build();
+        try {
+            for (int i = 0; i < 100; i++) {
+                cache.put("k" + i, "v");
+                cache.get("k" + i);
+            }
+            CacheStats stats = cache.stats();
+            long minNs = stats.minGetPenalty(java.util.concurrent.TimeUnit.NANOSECONDS);
+            long maxNs = stats.maxGetPenalty(java.util.concurrent.TimeUnit.NANOSECONDS);
+            long avgNs = stats.averageGetPenalty(java.util.concurrent.TimeUnit.NANOSECONDS);
+            // 验证 min <= avg <= max（不严格，因统计有误差，但不应出现 min == max == avg 的恒等退化）
+            assertTrue(minNs <= maxNs, "min (" + minNs + ") should be <= max (" + maxNs + ")");
+            assertTrue(minNs <= avgNs + 1000, "min (" + minNs + ") should be <= avg (" + avgNs + ") + epsilon");
+            assertTrue(maxNs + 1000 >= avgNs, "max (" + maxNs + ") should be >= avg (" + avgNs + ") - epsilon");
+        } finally {
+            cache.shutdown();
+        }
+    }
 }

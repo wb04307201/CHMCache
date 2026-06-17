@@ -98,7 +98,60 @@ class ExpirationPolicyTest {
             cache.put("k", "v");
             cache.get("k");
             cache.get("k");
-            assertEquals(2, readCalls.get());
+            // D10 修复后：自定义 expireAfter 也启用 sliding TTL，
+            // 每次 get 命中 + put 时 expireAfterRead 都会被调用
+            assertEquals(3, readCalls.get());
+        } finally {
+            cache.shutdown();
+        }
+    }
+
+    @Test
+    void testExpireAfterAccess_PutAlsoRefreshesTtl() throws InterruptedException {
+        // D10 回归测试：expireAfterAccess 模式下，put 也应刷新 TTL
+        CHMCache<String, String> cache = CHMCache.<String, String>newBuilder()
+                .maximumSize(10)
+                .expireAfterAccess(Duration.ofMillis(150))
+                .cleanupInterval(Duration.ofSeconds(60))
+                .build();
+        try {
+            cache.put("k", "v1");
+            Thread.sleep(100);
+            // 此时 put 重置 TTL
+            cache.put("k", "v2");
+            Thread.sleep(100);
+            // 如果 put 不刷新 TTL，原值已过期，应为 null；修复后应为 "v2"
+            assertEquals("v2", cache.get("k"));
+        } finally {
+            cache.shutdown();
+        }
+    }
+
+    @Test
+    void testRefreshAfterWrite_BackgroundRefreshes() throws InterruptedException {
+        // D11 回归测试：refreshAfterWrite 模式下，写后 N 秒后台异步刷新
+        java.util.concurrent.atomic.AtomicInteger loaderCalls = new java.util.concurrent.atomic.AtomicInteger();
+        CHMCache<String, String> cache = CHMCache.<String, String>newBuilder()
+                .maximumSize(10)
+                .refreshAfterWrite(Duration.ofMillis(100))
+                .cleanupInterval(Duration.ofMillis(50))
+                .build();
+        try {
+            cache.put("k", "v1");
+            cache.refresh("k", key -> {
+                loaderCalls.incrementAndGet();
+                return "v-refreshed";
+            });
+            // 等过 refresh 窗口并让后台跑几个周期
+            Thread.sleep(400);
+            // 等待后台异步刷新完成（至少触发 1 次）
+            long deadline = System.currentTimeMillis() + 2_000;
+            while (loaderCalls.get() < 1 && System.currentTimeMillis() < deadline) {
+                Thread.sleep(20);
+            }
+            assertTrue(loaderCalls.get() >= 1,
+                    "loader should be called at least once, was " + loaderCalls.get());
+            assertEquals("v-refreshed", cache.get("k"));
         } finally {
             cache.shutdown();
         }

@@ -51,6 +51,13 @@ public final class StripedLocks {
     }
 
     /**
+     * 按段索引直接获取锁（避免 hashCode 计算与字符串分配）。
+     */
+    public ReentrantLock lockFor(int stripe) {
+        return locks[stripe];
+    }
+
+    /**
      * 在指定 key 的段锁内执行动作。
      */
     public void withLock(Object key, Runnable action) {

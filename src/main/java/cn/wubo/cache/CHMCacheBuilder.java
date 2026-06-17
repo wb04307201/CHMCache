@@ -39,6 +39,7 @@ public final class CHMCacheBuilder<K, V> {
     private boolean statsEnabled = false;
     private boolean shardedLocks = true;
     private boolean slidingTtl = false;
+    private Duration refreshAfterWriteDuration = null;
     private Executor executor = ForkJoinPool.commonPool();
 
     CHMCacheBuilder() {}
@@ -55,6 +56,7 @@ public final class CHMCacheBuilder<K, V> {
     public boolean slidingTtl() { return slidingTtl; }
     public Executor executor() { return executor; }
     public RemovalListener<? super K, ? super V> removalListener() { return removalListener; }
+    public Duration refreshAfterWriteDuration() { return refreshAfterWriteDuration; }
 
     /**
      * 设置缓存实例名称。用于 Micrometer 集成时的指标前缀，默认 "default"。
@@ -115,10 +117,17 @@ public final class CHMCacheBuilder<K, V> {
     }
 
     /**
-     * 写后异步刷新。
+     * 写后异步刷新：经过指定时长后，后台线程会异步触发 {@link RefreshLoader} 重新加载值。
+     * 加载期间读端仍返回旧值，加载完成后替换。值的过期时间为 refresh 窗口的 2 倍，
+     * 给后台刷新留出充足时间；如果希望更短的过期时间，可显式叠加 {@link #expireAfterWrite}。
      */
     public CHMCacheBuilder<K, V> refreshAfterWrite(Duration duration) {
-        this.expiration = Expirations.refreshAfterWrite(duration);
+        Objects.requireNonNull(duration, "duration");
+        this.refreshAfterWriteDuration = duration;
+        if (this.expiration == null) {
+            // TTL = 2 × refresh window，留出时间让后台异步加载完成
+            this.expiration = Expirations.afterWrite(duration.multipliedBy(2));
+        }
         return this;
     }
 

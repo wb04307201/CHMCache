@@ -1,6 +1,7 @@
 package cn.wubo.cache.internal;
 
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 
 /**
@@ -30,6 +31,8 @@ public final class LatencyHistogram {
     };
 
     private final LongAdder[] buckets;
+    private final AtomicLong minNanos = new AtomicLong(Long.MAX_VALUE);
+    private final AtomicLong maxNanos = new AtomicLong(Long.MIN_VALUE);
 
     public LatencyHistogram() {
         this.buckets = new LongAdder[UPPER_BOUNDS_NANOS.length];
@@ -44,6 +47,32 @@ public final class LatencyHistogram {
     public void record(long elapsedNanos) {
         int idx = bucketIndex(elapsedNanos);
         buckets[idx].increment();
+        // 维护 min（CAS 直到更小）
+        long curMin;
+        do {
+            curMin = minNanos.get();
+            if (elapsedNanos >= curMin) break;
+        } while (!minNanos.compareAndSet(curMin, elapsedNanos));
+        // 维护 max（CAS 直到更大）
+        long curMax;
+        do {
+            curMax = maxNanos.get();
+            if (elapsedNanos <= curMax) break;
+        } while (!maxNanos.compareAndSet(curMax, elapsedNanos));
+    }
+
+    /**
+     * 最小观测值（纳秒）。无观测时返回 Long.MAX_VALUE。
+     */
+    public long minNanos() {
+        return minNanos.get();
+    }
+
+    /**
+     * 最大观测值（纳秒）。无观测时返回 Long.MIN_VALUE。
+     */
+    public long maxNanos() {
+        return maxNanos.get();
     }
 
     private static int bucketIndex(long nanos) {
@@ -97,5 +126,7 @@ public final class LatencyHistogram {
 
     public void clear() {
         for (LongAdder b : buckets) b.reset();
+        minNanos.set(Long.MAX_VALUE);
+        maxNanos.set(Long.MIN_VALUE);
     }
 }

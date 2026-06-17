@@ -76,6 +76,10 @@ public final class CHMCache<K, V> {
     private final LatencyHistogram getLatency;
     private final HotKeySampler<K> hotKeySampler;
 
+    // refreshAfterWrite 模式
+    private final Duration refreshAfterWrite;
+    private final ConcurrentHashMap<K, RefreshLoader<K, V>> refreshLoaders;
+
     // 后台
     private final ScheduledExecutorService cleanupExecutor;
     private final AtomicBoolean shutdown = new AtomicBoolean(false);
@@ -92,6 +96,8 @@ public final class CHMCache<K, V> {
         this.maxSizeOrWeight = isWeightBased ? b.maximumWeight() : b.maximumSize();
         this.eviction = b.resolveEviction();
         this.slidingTtl = b.slidingTtl() || customExpiry != null;
+        this.refreshAfterWrite = b.refreshAfterWriteDuration();
+        this.refreshLoaders = refreshAfterWrite != null ? new ConcurrentHashMap<>() : null;
         int initialCap = Math.max(16, (int) Math.ceil(maxSizeOrWeight / 0.75f) + 1);
         this.cacheMap = new ConcurrentHashMap<>(initialCap);
         this.accessOrder = new AccessOrderTracker<>(b.shardedLocks() ? 16 : 1);
@@ -126,7 +132,10 @@ public final class CHMCache<K, V> {
     // ============================================================
 
     public void put(K key, V value) {
-        put(key, value, Duration.ofNanos(computeTtl(key, value, true, false)));
+        validateKey(key);
+        // D10: expireAfterAccess 模式下，put 也是"访问"，应触发 TTL 续期
+        long ttlNanos = computeTtl(key, value, true, slidingTtl);
+        doPut(key, value, ttlNanos);
     }
 
     public void put(K key, V value, Duration ttl) {
@@ -134,6 +143,13 @@ public final class CHMCache<K, V> {
         Objects.requireNonNull(ttl, "ttl");
         long ttlNanos = ttl.toNanos();
         if (ttlNanos <= 0) throw new IllegalArgumentException("ttl must be positive");
+        doPut(key, value, ttlNanos);
+    }
+
+    /**
+     * 真正的 put 逻辑。显式 TTL 的 put 不会触发 sliding refresh。
+     */
+    private void doPut(K key, V value, long ttlNanos) {
         long token = tokenGenerator.incrementAndGet();
         long expireNanos = System.nanoTime() + ttlNanos;
         int weight = Math.max(1, weigher.weigh(key, value));
@@ -141,7 +157,6 @@ public final class CHMCache<K, V> {
 
         CacheValue<V> prior = cacheMap.put(key, cv);
         if (prior != null) {
-            // 替换：触发 REPLACED 事件，扣减旧 weight
             currentWeight.addAndGet(-prior.weight);
             notifyRemoval(key, prior.value, RemovalCause.REPLACED);
         }
@@ -152,7 +167,6 @@ public final class CHMCache<K, V> {
 
         expirationQueue.put(new DelayedItem<>(key, expireNanos, token));
 
-        // 同步 LRU
         evictIfNeeded();
     }
 
@@ -162,34 +176,36 @@ public final class CHMCache<K, V> {
 
     public V get(K key, CacheLoader<K, V> loader) {
         validateKey(key);
+        // D17: 延迟采样只覆盖"缓存本身的查找/过期"路径，loader 调用时间不计入 get.penalty
         long startNs = recordStats ? System.nanoTime() : 0L;
+        V result;
         try {
             CacheValue<V> cv = cacheMap.get(key);
             if (cv != null && cv.isExpired()) {
-                // 惰性过期
                 lazyExpireIfStillExpired(key, cv);
                 missCount.increment();
                 recordHotKey(key);
-                return loadFromLoader(key, loader);
-            }
-            if (cv != null) {
+                result = loadFromLoader(key, loader);
+            } else if (cv != null) {
                 hitCount.increment();
                 accessOrder.touch(key);
-                // 滑动 TTL：若启用，原子地替换 CacheValue 以刷新过期时间
+                recordHotKey(key);
+                // 滑动 TTL 续期（仅当 get 命中）
                 if (slidingTtl) {
                     refreshSlidingTtl(key, cv);
                 }
+                result = cv.value;
+            } else {
+                missCount.increment();
                 recordHotKey(key);
-                return cv.value;
+                result = loadFromLoader(key, loader);
             }
-            missCount.increment();
-            recordHotKey(key);
-            return loadFromLoader(key, loader);
         } finally {
             if (recordStats) {
                 getLatency.record(System.nanoTime() - startNs);
             }
         }
+        return result;
     }
 
     public boolean containsKey(K key) {
@@ -289,7 +305,59 @@ public final class CHMCache<K, V> {
     public void refresh(K key, RefreshLoader<K, V> loader) {
         validateKey(key);
         Objects.requireNonNull(loader, "loader");
-        asyncRefresher.refresh(this, key, loader);
+        if (refreshAfterWrite != null) {
+            // 注册到 refreshLoaders，由后台扫描触发
+            refreshLoaders.put(key, loader);
+        } else {
+            // 未启用 refreshAfterWrite：立即异步刷新
+            asyncRefresher.refresh(this, key, loader);
+        }
+    }
+
+    /**
+     * 批量 get + 批量加载。缓存命中的 key 直接返回；未命中的 key 收集后由 bulkLoader
+     * 一次性加载并回填。
+     *
+     * @param keys      要获取的 key 集合
+     * @param bulkLoader 接收未命中 key 集合，返回对应的 Map&lt;K, V&gt;；返回 null 表示"无法加载"
+     */
+    public java.util.Map<K, V> getAll(java.util.Set<? extends K> keys,
+                                      java.util.function.Function<java.util.Set<? extends K>, java.util.Map<? extends K, ? extends V>> bulkLoader) {
+        Objects.requireNonNull(keys, "keys");
+        Objects.requireNonNull(bulkLoader, "bulkLoader");
+        java.util.Map<K, V> result = new java.util.HashMap<>(keys.size() * 2);
+        java.util.Set<K> missing = new java.util.HashSet<>();
+        for (K key : keys) {
+            validateKey(key);
+            CacheValue<V> cv = cacheMap.get(key);
+            if (cv != null && cv.isExpired()) {
+                lazyExpireIfStillExpired(key, cv);
+                missCount.increment();
+                missing.add(key);
+            } else if (cv != null) {
+                hitCount.increment();
+                accessOrder.touch(key);
+                if (slidingTtl) refreshSlidingTtl(key, cv);
+                result.put(key, cv.value);
+            } else {
+                missCount.increment();
+                missing.add(key);
+            }
+        }
+        if (!missing.isEmpty()) {
+            java.util.Map<? extends K, ? extends V> loaded = bulkLoader.apply(missing);
+            if (loaded != null) {
+                for (java.util.Map.Entry<? extends K, ? extends V> e : loaded.entrySet()) {
+                    K key = e.getKey();
+                    V value = e.getValue();
+                    if (value != null) {
+                        put(key, value);
+                        result.put(key, value);
+                    }
+                }
+            }
+        }
+        return result;
     }
 
     private V loadFromLoader(K key, CacheLoader<K, V> loader) {
@@ -333,11 +401,11 @@ public final class CHMCache<K, V> {
      * 详细指标快照。仅当 {@link CHMCacheBuilder#recordStats()} 时返回有效数据。
      */
     public CacheStats stats() {
-        long avgNs = getLatency != null ? (long) getLatency.averageNanos() : 0L;
-        long minNs = 0, maxNs = 0;
+        long avgNs = 0L, minNs = 0L, maxNs = 0L;
         if (getLatency != null && getLatency.totalCount() > 0) {
-            minNs = avgNs;  // 简化：不维护精确 min/max
-            maxNs = avgNs;
+            avgNs = (long) getLatency.averageNanos();
+            minNs = getLatency.minNanos();
+            maxNs = getLatency.maxNanos();
         }
         return new CacheStats(
                 hitCount.sum(),
@@ -361,17 +429,16 @@ public final class CHMCache<K, V> {
     // ============================================================
 
     private void refreshSlidingTtl(K key, CacheValue<V> cv) {
-        // 原子地替换 CacheValue：accessTimeNanos 重新置为 now，新 token 配对新的 DelayedItem。
+        // D1: 先准备好新的 CacheValue 但不分配 token；如果 replace 失败则不分配 token，
+        //     避免残留幽灵 DelayedItem。
         long now = System.nanoTime();
         long newTtlNanos = computeTtl(key, cv.value, false, true);
         long newToken = tokenGenerator.incrementAndGet();
         CacheValue<V> refreshed = new CacheValue<>(cv.value, newTtlNanos, newToken, cv.weight);
-        // 因为 refreshed.createTimeNanos = now 但 accessTimeNanos = now（构造时同时赋值），
-        // 实际等效于 createTime 刷新。等价实现：保留旧 weight，重新 put 一个 accessTimeNanos=now 的实例
         if (cacheMap.replace(key, cv, refreshed)) {
             expirationQueue.put(new DelayedItem<>(key, now + newTtlNanos, newToken));
         }
-        // 替换失败说明并发修改，不做处理（下次 get 重新触发）
+        // 替换失败（并发 put/invalidate）：放弃本次新 token，下次 get 重新触发
     }
 
     private void lazyExpireIfStillExpired(K key, CacheValue<V> cv) {
@@ -399,27 +466,32 @@ public final class CHMCache<K, V> {
     }
 
     private void doEvict() {
-        // 分段 LRU 遍历
-        int targetEvictions = computeEvictionCount();
-        int evicted = 0;
-        for (int stripe = 0; stripe < accessOrder.stripeCount() && evicted < targetEvictions; stripe++) {
-            LinkedHashMap<K, Boolean> seg = accessOrder.segmentAt(stripe);
-            synchronized (accessOrder.stripedLocks().lockFor("seg-" + stripe)) {
-                Iterator<Map.Entry<K, Boolean>> it = seg.entrySet().iterator();
-                while (it.hasNext() && evicted < targetEvictions) {
-                    Map.Entry<K, Boolean> e = it.next();
-                    K key = e.getKey();
-                    CacheValue<V> removed = cacheMap.remove(key);
-                    it.remove();
-                    if (removed != null) {
-                        currentWeight.addAndGet(-removed.weight);
-                        notifyRemoval(key, removed.value,
-                                isWeightBased ? RemovalCause.WEIGHT : RemovalCause.SIZE);
-                        evictionCount.increment();
-                        evicted++;
+        // D7: while 循环直到 size 满足约束（多段场景下，单次遍历可能淘汰不够）
+        while (true) {
+            int targetEvictions = computeEvictionCount();
+            if (targetEvictions <= 0) return;
+            int evicted = 0;
+            for (int stripe = 0; stripe < accessOrder.stripeCount() && evicted < targetEvictions; stripe++) {
+                LinkedHashMap<K, Boolean> seg = accessOrder.segmentAt(stripe);
+                synchronized (accessOrder.stripedLocks().lockFor(stripe)) {
+                    Iterator<Map.Entry<K, Boolean>> it = seg.entrySet().iterator();
+                    while (it.hasNext() && evicted < targetEvictions) {
+                        Map.Entry<K, Boolean> e = it.next();
+                        K key = e.getKey();
+                        CacheValue<V> removed = cacheMap.remove(key);
+                        it.remove();
+                        if (removed != null) {
+                            currentWeight.addAndGet(-removed.weight);
+                            notifyRemoval(key, removed.value,
+                                    isWeightBased ? RemovalCause.WEIGHT : RemovalCause.SIZE);
+                            evictionCount.increment();
+                            evicted++;
+                        }
                     }
                 }
             }
+            // 防止无限循环：CAS 失败（外部 put 又超出）或一轮没淘汰任何东西
+            if (evicted == 0) return;
         }
     }
 
@@ -445,7 +517,6 @@ public final class CHMCache<K, V> {
         long start = System.nanoTime();
         try {
             // 排空延迟队列
-            List<K> toRemove = new ArrayList<>();
             while (true) {
                 DelayedItem<K> item = expirationQueue.poll();
                 if (item == null) break;
@@ -458,9 +529,26 @@ public final class CHMCache<K, V> {
                     return v;
                 });
                 if (removed[0]) {
-                    CacheValue<V> cv = cacheMap.get(item.key); // 已 null
-                    toRemove.add(item.key);
                     expirationCount.increment();
+                }
+            }
+            // D11: refreshAfterWrite 扫描 — 写后达到 refreshAfterWrite 的 key 触发后台异步刷新
+            if (refreshAfterWrite != null && !refreshLoaders.isEmpty()) {
+                long refreshAfterNanos = refreshAfterWrite.toNanos();
+                long now = System.nanoTime();
+                for (K key : refreshLoaders.keySet()) {
+                    CacheValue<V> cv = cacheMap.get(key);
+                    if (cv == null) {
+                        // 已过期/淘汰，清掉 loader
+                        refreshLoaders.remove(key);
+                        continue;
+                    }
+                    if (now - cv.createTimeNanos >= refreshAfterNanos) {
+                        RefreshLoader<K, V> loader = refreshLoaders.get(key);
+                        if (loader != null) {
+                            asyncRefresher.refresh(this, key, loader);
+                        }
+                    }
                 }
             }
             // 全量/采样扫描

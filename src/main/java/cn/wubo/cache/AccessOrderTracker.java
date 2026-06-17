@@ -90,7 +90,7 @@ public final class AccessOrderTracker<K> {
         int removed = 0;
         for (int stripe = 0; stripe < segments.length; stripe++) {
             LinkedHashMap<K, Boolean> seg = segments[stripe];
-            synchronized (stripedLocks.lockFor("seg-" + stripe)) {
+            synchronized (stripedLocks.lockFor(stripe)) {
                 Iterator<Map.Entry<K, Boolean>> it = seg.entrySet().iterator();
                 while (it.hasNext()) {
                     Map.Entry<K, Boolean> e = it.next();
@@ -109,7 +109,7 @@ public final class AccessOrderTracker<K> {
      */
     public void clear() {
         for (int stripe = 0; stripe < segments.length; stripe++) {
-            synchronized (stripedLocks.lockFor("seg-" + stripe)) {
+            synchronized (stripedLocks.lockFor(stripe)) {
                 segments[stripe].clear();
             }
         }
