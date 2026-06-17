@@ -1,150 +1,265 @@
-# CHMCacheCHMCache - 基于ConcurrentHashMap的缓存实现
+# CHMCache - 基于 ConcurrentHashMap 的 Caffeine 风格缓存实现
 
-一个基于 `ConcurrentHashMap` 和 LRU 策略的缓存实现，支持自动过期、大小限制、LRU 淘汰和后台清理等特性。
+一个基于 `ConcurrentHashMap` 的高性能缓存库，提供 **Caffeine 风格的 API**，支持自动过期、LRU 淘汰、权重淘汰、事件回调、加载器、Micrometer 集成等特性。
 
 [![](https://jitpack.io/v/com.gitee.wb04307201/CHMCache.svg)](https://jitpack.io/#com.gitee.wb04307201/CHMCache)
 
-## 特性
+## 核心特性
 
-- **高性能**: 基于 `ConcurrentHashMap` 实现，支持高并发访问
-- **自动过期**: 支持设置缓存项的生存时间(TTL)，自动清理过期项
-- **LRU 淘汰**: 当缓存达到最大容量时，自动移除最近最少使用的项
-- **后台清理**: 定时清理过期项，减少主线程负担
-- **线程安全**: 完整的线程安全设计，适用于多线程环境
-- **监控指标**: 提供缓存命中率、清理时间等监控数据
+- **Caffeine 风格 API**：`maximumSize` / `expireAfterWrite` / `expireAfterAccess` / `refreshAfterWrite` / `removalListener` / `recordStats`
+- **三种过期策略**：写后过期（默认）、滑动 TTL、异步刷新
+- **两种淘汰策略**：按条目数淘汰、按累计权重淘汰
+- **事件回调**：`RemovalListener` 区分 7 种 `RemovalCause`
+- **加载器模式**：`get(K, CacheLoader)`、`computeIfAbsent`、异步 `refresh`
+- **观测能力**：`CacheMetrics`（始终可用）+ `CacheStats`（recordStats 后可用，含延迟分桶与热点 Key 采样）
+- **Micrometer 集成**：`CHMCacheMetricsBinder` 一键发布到 `MeterRegistry`
+- **分片锁**（16 段，默认开启）：解决全量访问顺序的锁竞争
+- **Java 17 干净实现**：基于 `ConcurrentHashMap` + `LinkedHashMap`（accessOrder=true），零三方核心依赖
 
 ---
 
 ## 引入
 
-### 增加 JitPack 仓库
-```xml
-<repositories>
-    <repository>
-        <id>jitpack.io</id>
-        <url>https://jitpack.io</url>
-    </repository>
-</repositories>
-```
-### 添加依赖
+### Maven（推荐）
+
 ```xml
 <dependency>
     <groupId>com.gitee.wb04307201</groupId>
     <artifactId>CHMCache</artifactId>
-    <version>1.0.1</version>
+    <version>2.0.0</version>
+</dependency>
+```
+
+### Micrometer 集成（可选）
+
+```xml
+<dependency>
+    <groupId>io.micrometer</groupId>
+    <artifactId>micrometer-core</artifactId>
+    <version>1.13.4</version>
 </dependency>
 ```
 
 ---
 
-## 使用方法
-
-### 1. 创建缓存实例
+## 快速上手
 
 ```java
-import java.util.concurrent.TimeUnit;
+import java.time.Duration;
+import cn.wubo.cache.CHMCache;
 
-// 使用默认配置（最大容量1000，TTL 60秒）
-CHMCache<String, Object> cache = new CHMCache<>();
+CHMCache<String, User> cache = CHMCache.<String, User>newBuilder()
+    .name("users")
+    .maximumSize(10_000)
+    .expireAfterWrite(Duration.ofMinutes(5))
+    .removalListener((k, v, cause) -> log.info("{} removed ({})", k, cause))
+    .recordStats()
+    .build();
 
-// 自定义配置
-CHMCache<String, Object> cache = new CHMCache<>(5000, 30_000); // 最大容量5000，TTL 30秒
-
-// 自定义配置
-CHMCache<String, Object> cache = new CHMCache<>(5000, 30, TimeUnit.SECONDS); // 最大容量5000，TTL 30秒
+cache.put("u:1", user);
+User u = cache.get("u:1");
+cache.invalidate("u:1");
 ```
 
+---
 
-### 2. 添加缓存项
+## API 一览
+
+### 1. 创建缓存
 
 ```java
-// 使用默认TTL
-cache.put("key1", "value1");
+// 条目数上限
+CHMCache<String, String> c1 = CHMCache.<String, String>newBuilder()
+    .maximumSize(10_000)
+    .build();
 
-// 指定TTL（毫秒）
-cache.put("key2", "value2", 10_000); // 10秒后过期
+// 累计权重上限
+CHMCache<String, byte[]> c2 = CHMCache.<String, byte[]>newBuilder()
+    .maximumWeight(100 * 1024 * 1024)
+    .weigher((k, v) -> v.length)
+    .build();
 
-// 指定TTL
-cache.put("key2", "value2", 10, TimeUnit.SECONDS); // 10秒后过期
+// 写后过期（默认）
+CHMCache<String, String> c3 = CHMCache.<String, String>newBuilder()
+    .maximumSize(10_000)
+    .expireAfterWrite(Duration.ofMinutes(5))
+    .build();
+
+// 滑动 TTL
+CHMCache<String, String> c4 = CHMCache.<String, String>newBuilder()
+    .maximumSize(10_000)
+    .expireAfterAccess(Duration.ofMinutes(30))
+    .build();
+
+// 写后异步刷新
+CHMCache<String, String> c5 = CHMCache.<String, String>newBuilder()
+    .maximumSize(10_000)
+    .refreshAfterWrite(Duration.ofMinutes(4))
+    .build();
+
+// 自定义过期
+CHMCache<String, String> c6 = CHMCache.<String, String>newBuilder()
+    .maximumSize(10_000)
+    .expireAfter((k, v, currentTimeNanos) ->
+        v.startsWith("hot:") ? Duration.ofMinutes(30) : Duration.ofMinutes(1))
+    .build();
 ```
 
-
-### 3. 获取缓存项
+### 2. 数据操作
 
 ```java
-String value = cache.get("key1");
-if (value != null) {
-    // 使用缓存值
-} else {
-    // 缓存未命中，需要重新加载
-}
+// put
+cache.put("k", "v");
+cache.put("k", "v", Duration.ofSeconds(10));
+
+// get
+String v = cache.get("k");
+String loaded = cache.get("k", key -> userRepo.load((String) key));
+String computed = cache.computeIfAbsent("k", key -> "v-" + key);
+
+// 异步刷新
+cache.refresh("k", key -> userRepo.load((String) key));
+
+// 失效
+cache.invalidate("k");
+cache.invalidateIf(k -> ((String) k).startsWith("user:"));
+cache.invalidateAll();
 ```
 
-
-### 4. 删除缓存项
+### 3. 观测
 
 ```java
-String removedValue = cache.remove("key1");
+// 轻量指标：始终可用
+CacheMetrics m = cache.metrics();
+long hits = m.hitCount();
+long miss = m.missCount();
+double rate = m.hitRate();
+
+// 详细统计：recordStats() 后非空
+CacheStats s = cache.stats();
+s.hitRate();
+s.averageGetPenalty(TimeUnit.MICROSECONDS);
+s.evictionCount();
+s.sizeWatermark();
 ```
 
-
-### 5. 关闭缓存
+### 4. Micrometer 集成
 
 ```java
-// 应用关闭前调用，停止后台清理线程
-cache.shutdown();
+import cn.wubo.cache.internal.CHMCacheMetricsBinder;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+
+MeterRegistry registry = new SimpleMeterRegistry();
+new CHMCacheMetricsBinder(cache).bindTo(registry);
+
+// 注册的指标：
+//   chmcache.{name}.size       (Gauge)
+//   chmcache.{name}.hit        (Counter)
+//   chmcache.{name}.miss       (Counter)
+//   chmcache.{name}.eviction   (Counter)
+//   chmcache.{name}.expiration (Counter)
+//   chmcache.{name}.get.penalty (Timer)
+
+// 周期调用 publish() 将 cache 内部计数器的差值推送到 Micrometer
+scheduler.scheduleAtFixedRate(
+    () -> new CHMCacheMetricsBinder(cache).publish(),
+    0, 10, TimeUnit.SECONDS);
 ```
 
-### 核心方法
+---
 
-| 方法                                                        | 描述               |
-|-----------------------------------------------------------|------------------|
-| `void put(K key, V value)`                                | 添加缓存项，使用默认随机TTL  |
-| `void put(K key, V value, long ttlMillis)`                | 添加缓存项，指定TTL(毫秒)  |
-| `void put(K key, V value, long ttlMillis, TimeUnit unit)` | 添加缓存项，指定TTL和时间单位 |
-| `V get(K key)`                                            | 获取缓存项            |
-| `V remove(K key)`                                         | 删除缓存项            |
-| `int size()`                                              | 获取当前缓存大小         |
-| `void cleanup()`                                          | 手动触发清理过期项        |
-| `void shutdown()`                                         | 关闭缓存，停止后台清理线程    |
-| `MonitorMetrics getMetrics()`                             | 获取监控指标           |
+## Builder 完整配置
 
-## 监控指标
+| 方法 | 说明 | 默认值 |
+| --- | --- | --- |
+| `name(String)` | 缓存实例名，指标前缀 | `"default"` |
+| `maximumSize(long)` | 最大条目数 | 必填（与 maximumWeight 互斥） |
+| `maximumWeight(long)` | 最大累计权重 | 必填（与 maximumSize 互斥） |
+| `weigher(Weigher)` | 权重计算器 | 永远返回 1 |
+| `expireAfterWrite(Duration)` | 写后过期 | 永不过期 |
+| `expireAfterAccess(Duration)` | 滑动 TTL（get 命中时刷新） | - |
+| `refreshAfterWrite(Duration)` | 写后异步刷新 | - |
+| `expireAfter(Expiry)` | 自定义过期（覆盖以上三个） | - |
+| `cleanupInterval(Duration)` | 后台清理线程周期 | 1 秒 |
+| `removalListener(RemovalListener)` | 移除事件回调 | 无 |
+| `recordStats()` | 启用详细统计 | 关 |
+| `shardedLocks(boolean)` | 是否启用分片锁 | true |
+| `executor(Executor)` | 自定义 refresh 任务执行器 | `ForkJoinPool.commonPool()` |
 
-```java
-MonitorMetrics metrics = cache.getMetrics();
+---
 
-long hitCount = metrics.getHitCount();         // 命中次数
-long missCount = metrics.getMissCount();       // 未命中次数
-long evictionCount = metrics.getEvictionCount(); // 淘汰次数
-double hitRate = metrics.getHitRate();         // 命中率
-int currentSize = metrics.getCurrentSize();    // 当前缓存大小
+## 三层功能矩阵
+
+| 能力 | Tier 1 基础 | Tier 2 进阶 | Tier 3 高阶 |
+| --- | --- | --- | --- |
+| 容量 | `maximumSize` | `maximumWeight` + `weigher` | - |
+| 过期 | `expireAfterWrite` | `expireAfterAccess`（滑动） | `expireAfter`（自定义） |
+| 失效 | `invalidate(K)` | `invalidateIf(Predicate)` | `invalidateAll()` |
+| 加载 | `computeIfAbsent` | `get(K, CacheLoader)` | `refresh(K, RefreshLoader)` 异步 |
+| 观测 | `CacheMetrics`（轻量） | `CacheStats`（含延迟/热点） | `CHMCacheMetricsBinder` Micrometer |
+| 性能 | - | - | 分片锁（16 段） |
+| 事件 | - | `RemovalListener` + 7 种 `RemovalCause` | - |
+
+---
+
+## 运行测试与 Benchmark
+
+### 单元测试
+
+```bash
+mvn test
 ```
 
-## 缓存策略
+### JMH Benchmark
 
-### 过期策略
+```bash
+# 编译 benchmark
+mvn -Pbenchmark test-compile
 
-- 支持为每个缓存项设置独立的TTL（生存时间）
-- 默认TTL可在构造时指定
-- 使用随机化TTL（±20%）避免缓存雪崩
-- 采用惰性删除和主动清理相结合的方式
+# 打包可执行 jar
+mvn -Pbenchmark package -DskipTests
 
-### 淘汰策略
+# 跑 benchmark（4 个对照组：CHMCache / Caffeine / Guava / 裸 CHM）
+java -jar target/CHMCache-2.0.0-SNAPSHOT.jar -rf json -rff target/jmh-results/results.json
+```
 
-- LRU（最近最少使用）策略
-- 当缓存大小超过阈值时自动触发淘汰
-- 后台定时线程定期执行清理任务
+Benchmark 覆盖：`getOnly` / `putOnly` / `mixed (90% get + 10% put)`，容量 10K / 100K，8 线程。
 
-## 性能优化建议
+---
 
-1. **合理设置缓存大小**: 根据应用内存和访问模式设置合适的 [maxSize](src/main/java/cn/wubo/cache/CHMCache.java#L25-L25)
-2. **调整TTL**: 根据数据变化频率设置合适的过期时间
-3. **监控指标**: 定期检查命中率等指标，优化缓存配置
-4. **及时关闭**: 应用结束时调用 [shutdown()](src/main/java/cn/wubo/cache/CHMCache.java#L288-L298) 方法释放资源
+## 设计要点
+
+- **三个数据结构协同**：`ConcurrentHashMap`（无锁读写）+ 分片 `AccessOrderTracker`（按 key hash 分桶，每桶独立 lock）+ `DelayQueue`（显式到期项）
+- **原子校验**：每条缓存项携带唯一 token，`DelayedItem` 到期回收时通过 `computeIfPresent` 做原子校验，避免误删新值
+- **TTL 单调时钟**：基于 `System.nanoTime()`，避免系统时钟回拨（NTP 校时）导致过期判断异常
+- **后台清理**：`daemon` 线程包 `try-catch`，异常不会静默取消后续调度；`shutdown()` 幂等
+- **分片 LRU**：段内严格 LRU，段间近似。文档化此权衡，与 Caffeine 同样的取舍
+- **零三方核心依赖**：Micrometer / Caffeine / Guava 全部 `<optional>true</optional>`
+
+---
 
 ## 注意事项
 
-1. **线程安全**: 所有公共方法都是线程安全的
-2. **内存管理**: 缓存会自动清理过期项，但建议在应用结束时调用 [shutdown()](src/main/java/cn/wubo/cache/CHMCache.java#L288-L298)
-3. **LRU实现**: 当前LRU实现使用全局锁，在高并发场景下可能成为性能瓶颈
+1. **线程安全**：所有公共方法都是线程安全的
+2. **内存管理**：缓存会自动清理过期项，但建议在应用结束时调用 `shutdown()` 释放后台线程
+3. **LRU 实现**：分片锁破坏全局 LRU 严格性，段内严格、段间近似。如需严格 LRU 顺序请使用 `shardedLocks(false)`
+4. **滑动 TTL**：启用 `expireAfterAccess` 后，每次 get 命中会有一次原子 `replace` 开销
+5. **过期时间单位**：所有时间相关配置使用 `Duration`，内部统一以纳秒存储
+
+---
+
+## 升级说明（v1.x → v2.0）
+
+v2.0 **破坏向后兼容**。迁移清单：
+
+| v1.x | v2.0 |
+| --- | --- |
+| `new CHMCache<>()` / `new CHMCache<>(maxSize, ttl)` | `CHMCache.newBuilder().maximumSize(...).build()` |
+| `new CHMCache<>(maxSize, ttl, unit)` / `new CHMCache<>(maxSize, ttl, unit, cleanupInterval)` | Builder 链式调用 |
+| `put(k, v, long)` / `put(k, v, long, unit)` | `put(k, v, Duration.ofSeconds(...))` |
+| `cache.remove(k)` | `cache.invalidate(k)` |
+| `cache.clear()` | `cache.invalidateAll()` |
+| `cache.getMetrics().getHitCount()` | `cache.metrics().hitCount()` |
+| `cache.putIfAbsent(k, v)` | `cache.computeIfAbsent(k, key -> v)` |
+| `CacheLoader` 隐式存在 | `CacheLoader` / `RefreshLoader` 显式传入 |
