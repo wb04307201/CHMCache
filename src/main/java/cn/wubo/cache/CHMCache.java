@@ -17,6 +17,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 import java.util.function.Predicate;
 
@@ -365,8 +366,10 @@ public final class CHMCache<K, V> {
         long start = System.nanoTime();
         try {
             V loaded = loader.load(key);
-            loadCount.increment();
+            // 修复 Bug 4:loadCount 仅在 loader 返回非 null 时累加
+            // (与 CacheStats.loadFailureRate 注释"不含返回 null 的情况"保持一致)
             if (loaded != null) {
+                loadCount.increment();
                 put(key, loaded);
             }
             return loaded;
@@ -473,7 +476,11 @@ public final class CHMCache<K, V> {
             int evicted = 0;
             for (int stripe = 0; stripe < accessOrder.stripeCount() && evicted < targetEvictions; stripe++) {
                 LinkedHashMap<K, Boolean> seg = accessOrder.segmentAt(stripe);
-                synchronized (accessOrder.stripedLocks().lockFor(stripe)) {
+                // 修复 Bug 5:必须使用与 touch/remove 一致的 ReentrantLock,
+                // 否则 synchronized 与 ReentrantLock 不互斥,LinkedHashMap.iterator() 抛 CME
+                ReentrantLock stripeLock = accessOrder.stripedLocks().lockFor(stripe);
+                stripeLock.lock();
+                try {
                     Iterator<Map.Entry<K, Boolean>> it = seg.entrySet().iterator();
                     while (it.hasNext() && evicted < targetEvictions) {
                         Map.Entry<K, Boolean> e = it.next();
@@ -488,6 +495,8 @@ public final class CHMCache<K, V> {
                             evicted++;
                         }
                     }
+                } finally {
+                    stripeLock.unlock();
                 }
             }
             // 防止无限循环：CAS 失败（外部 put 又超出）或一轮没淘汰任何东西
@@ -521,15 +530,20 @@ public final class CHMCache<K, V> {
                 DelayedItem<K> item = expirationQueue.poll();
                 if (item == null) break;
                 boolean[] removed = {false};
+                int[] removedWeight = {0};
                 cacheMap.computeIfPresent(item.key, (k, v) -> {
                     if (v.token == item.token) {
                         removed[0] = true;
+                        removedWeight[0] = v.weight;
                         return null;
                     }
                     return v;
                 });
                 if (removed[0]) {
                     expirationCount.increment();
+                    // 修复 Bug 6:通过 DelayQueue 路径移除的过期项也必须减少 currentWeight,
+                    // 否则 weight-based 模式下 weightedSize 会单调递增,破坏不变量
+                    currentWeight.addAndGet(-removedWeight[0]);
                 }
             }
             // D11: refreshAfterWrite 扫描 — 写后达到 refreshAfterWrite 的 key 触发后台异步刷新
@@ -610,14 +624,16 @@ public final class CHMCache<K, V> {
         long now = System.nanoTime();
         if (customExpiry != null) {
             Duration d;
-            if (isRead) d = customExpiry.expireAfterRead(key, value, now);
-            else if (isCreate) d = customExpiry.expireAfterCreate(key, value, now);
+            // isCreate 优先于 isRead:put 路径必须触发 expireAfterCreate
+            // (修复 Bug:sliding TTL 模式下 put 被误判为 read,导致 expireAfterCreate 永不调用)
+            if (isCreate) d = customExpiry.expireAfterCreate(key, value, now);
+            else if (isRead) d = customExpiry.expireAfterRead(key, value, now);
             else d = customExpiry.expireAfterUpdate(key, value, now);
             return Math.max(0L, d.toNanos());
         }
         Duration d;
-        if (isRead) d = expiration.expireAfterRead(key, value, now);
-        else if (isCreate) d = expiration.expireAfterCreate(key, value, now);
+        if (isCreate) d = expiration.expireAfterCreate(key, value, now);
+        else if (isRead) d = expiration.expireAfterRead(key, value, now);
         else d = expiration.expireAfterUpdate(key, value, now);
         return Math.max(0L, d.toNanos());
     }

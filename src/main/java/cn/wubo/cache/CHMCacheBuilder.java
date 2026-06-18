@@ -104,6 +104,8 @@ public final class CHMCacheBuilder<K, V> {
      */
     public CHMCacheBuilder<K, V> expireAfterWrite(Duration duration) {
         this.expiration = Expirations.afterWrite(duration);
+        // 显式写后过期 = 固定 TTL,关闭 sliding 以遵循用户最后一次显式声明
+        this.slidingTtl = false;
         return this;
     }
 
@@ -153,7 +155,7 @@ public final class CHMCacheBuilder<K, V> {
      * 设置条目移除监听器。
      */
     public CHMCacheBuilder<K, V> removalListener(RemovalListener<? super K, ? super V> listener) {
-        this.removalListener = listener;
+        this.removalListener = Objects.requireNonNull(listener, "removalListener");
         return this;
     }
 

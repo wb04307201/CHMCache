@@ -78,10 +78,12 @@ class ExpirationPolicyTest {
 
     @Test
     void testCustomExpiry_ReadHook() throws InterruptedException {
+        java.util.concurrent.atomic.AtomicInteger createCalls = new java.util.concurrent.atomic.AtomicInteger();
         java.util.concurrent.atomic.AtomicInteger readCalls = new java.util.concurrent.atomic.AtomicInteger();
         Expiry<String, String> expiry = new Expiry<>() {
             @Override
             public Duration expireAfterCreate(String k, String v, long t) {
+                createCalls.incrementAndGet();
                 return Duration.ofSeconds(60);
             }
             @Override
@@ -98,9 +100,9 @@ class ExpirationPolicyTest {
             cache.put("k", "v");
             cache.get("k");
             cache.get("k");
-            // D10 修复后：自定义 expireAfter 也启用 sliding TTL，
-            // 每次 get 命中 + put 时 expireAfterRead 都会被调用
-            assertEquals(3, readCalls.get());
+            // 修复后:put 触发 expireAfterCreate,get 触发 expireAfterRead
+            assertEquals(1, createCalls.get(), "put 应调用 expireAfterCreate 1 次");
+            assertEquals(2, readCalls.get(), "2 次 get 应调用 expireAfterRead 共 2 次");
         } finally {
             cache.shutdown();
         }

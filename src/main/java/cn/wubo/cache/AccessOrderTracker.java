@@ -3,6 +3,7 @@ package cn.wubo.cache;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiConsumer;
 
 import cn.wubo.cache.internal.StripedLocks;
@@ -90,7 +91,11 @@ public final class AccessOrderTracker<K> {
         int removed = 0;
         for (int stripe = 0; stripe < segments.length; stripe++) {
             LinkedHashMap<K, Boolean> seg = segments[stripe];
-            synchronized (stripedLocks.lockFor(stripe)) {
+            // 修复 Bug 5:必须使用 ReentrantLock 与 touch/remove 一致,
+            // 否则 synchronized 与 ReentrantLock 不互斥,LinkedHashMap.iterator() 抛 CME
+            ReentrantLock lock = stripedLocks.lockFor(stripe);
+            lock.lock();
+            try {
                 Iterator<Map.Entry<K, Boolean>> it = seg.entrySet().iterator();
                 while (it.hasNext()) {
                     Map.Entry<K, Boolean> e = it.next();
@@ -99,6 +104,8 @@ public final class AccessOrderTracker<K> {
                     it.remove();
                     removed++;
                 }
+            } finally {
+                lock.unlock();
             }
         }
         return removed;
@@ -109,8 +116,13 @@ public final class AccessOrderTracker<K> {
      */
     public void clear() {
         for (int stripe = 0; stripe < segments.length; stripe++) {
-            synchronized (stripedLocks.lockFor(stripe)) {
+            // 修复 Bug 5:统一使用 ReentrantLock
+            ReentrantLock lock = stripedLocks.lockFor(stripe);
+            lock.lock();
+            try {
                 segments[stripe].clear();
+            } finally {
+                lock.unlock();
             }
         }
     }
