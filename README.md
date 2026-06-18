@@ -2,7 +2,13 @@
 
 > 一个基于 `ConcurrentHashMap` 的高性能缓存库，提供 **Caffeine 风格的 API**，支持自动过期、LRU 淘汰、权重淘汰、事件回调、加载器等特性。
 
-[![](https://jitpack.io/v/io.github.wb04307201/CHMCache.svg)](https://jitpack.io/#io.github.wb04307201/CHMCache)
+![Maven Central](https://img.shields.io/maven-central/v/io.github.wb04307201/CHMCache?style=flat-square)
+[![star](https://gitee.com/wb04307201/CHMCache/badge/star.svg?theme=dark)](https://gitee.com/wb04307201/CHMCache)
+[![fork](https://gitee.com/wb04307201/CHMCache/badge/fork.svg?theme=dark)](https://gitee.com/wb04307201/CHMCache)
+[![star](https://img.shields.io/github/stars/wb04307201/CHMCache)](https://github.com/wb04307201/CHMCache)
+[![fork](https://img.shields.io/github/forks/wb04307201/CHMCache)](https://github.com/wb04307201/CHMCache)
+![License](https://img.shields.io/badge/License-Apache2.0-blue.svg)
+![JDK](https://img.shields.io/badge/JDK-17+-green.svg)
 
 ## 核心特性
 
