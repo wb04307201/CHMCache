@@ -10,11 +10,11 @@
 - **三种过期策略**：写后过期（默认）、滑动 TTL、异步刷新
 - **两种淘汰策略**：按条目数淘汰、按累计权重淘汰
 - **事件回调**：`RemovalListener` 区分 7 种 `RemovalCause`
-- **加载器模式**：`get(K, CacheLoader)`、`computeIfAbsent`、异步 `refresh`
+- **加载器模式**：`get(K, CacheLoader)`、`computeIfAbsent`、`getAll(批量加载)`、异步 `refresh`
 - **观测能力**：`CacheMetrics`（始终可用）+ `CacheStats`（recordStats 后可用，含延迟分桶与热点 Key 采样）
 - **Micrometer 集成**：`CHMCacheMetricsBinder` 一键发布到 `MeterRegistry`
-- **分片锁**（16 段，默认开启）：解决全量访问顺序的锁竞争
-- **Java 17 干净实现**：基于 `ConcurrentHashMap` + `LinkedHashMap`（accessOrder=true），零三方核心依赖
+- **分片 LRU**（默认 16 段）：每段独立 `ReentrantLock` + `LinkedHashMap(accessOrder=true)`，段内严格 LRU、段间近似
+- **Java 17 干净实现**：基于 `ConcurrentHashMap` + 分片 `LinkedHashMap` + `DelayQueue`，零三方核心依赖
 
 ---
 
@@ -124,6 +124,17 @@ cache.refresh("k", key -> userRepo.load((String) key));
 cache.invalidate("k");
 cache.invalidateIf(k -> ((String) k).startsWith("user:"));
 cache.invalidateAll();
+
+// 手动触发一次清理(后台清理线程之外,等同 fullScan=true)
+cache.cleanup();
+
+// 权重模式专属:当前累计权重
+long ws = cache.weightedSize();
+
+// 批量加载(命中回填,未命中走 bulkLoader)
+Map<String, User> loaded = cache.getAll(
+    Set.of("u:1", "u:2", "u:3"),
+    missing -> userRepo.loadAll(missing));
 ```
 
 ### 3. 观测
@@ -211,6 +222,17 @@ scheduler.scheduleAtFixedRate(
 mvn test
 ```
 
+当前 **232 个测试**全部通过（5 次连跑稳定无 flaky），覆盖 9 轮深度探针：
+
+- **基础功能**：put / get / remove / 过期 / LRU / metrics / cleanup / 默认构造
+- **Token 安全性**：`DelayedItem` 与 cacheMap 条目通过 token 校验，避免误删新值
+- **统计一致性**：`hit/miss/eviction/load/loadFailure` 计数在并发与异常路径下均准确
+- **线程安全**：8 线程 × 5000 次 put 后 `size == maximumSize`；cleanup 与 put 并发无 CME
+- **权重一致性**：weight-based 模式下 `weightedSize()` 不漂移
+- **自定义组件鲁棒性**：`Expiry` / `Weigher` / `RemovalListener` 异常隔离
+- **AsyncRefresher**：refreshAfterWrite 模式、null 返回、shutdown 后行为
+- **资源/内存峰值**：高频短 TTL 突发 + 后台清理不 OOM
+
 ### JMH Benchmark
 
 ```bash
@@ -239,13 +261,30 @@ Benchmark 覆盖：`getOnly` / `putOnly` / `mixed (90% get + 10% put)`，容量 
 
 ---
 
+## v2.0 探针修复记录
+
+9 轮深度探针（232 个测试）发现的 6 个缺陷已全部修复：
+
+| # | 缺陷 | 修复 |
+| --- | --- | --- |
+| 1 | `removalListener(null)` 静默接受 | `CHMCacheBuilder` 增 `Objects.requireNonNull` 校验 |
+| 2 | `computeTtl` 中 `isRead` 优先级高于 `isCreate`，`expireAfterCreate` 永不触发 | 调整分支顺序，`isCreate` 优先 |
+| 3 | `expireAfterWrite` 不重置 `slidingTtl`，与 `expireAfterAccess` 冲突 | 显式重置 `slidingTtl = false` |
+| 4 | `loadCount` 在 loader 返回 null 时被累加，破坏 `loadFailureRate` 语义 | 移入 `if (loaded != null)` 分支 |
+| 5 | `ReentrantLock` 与 `synchronized` 混用导致 `LinkedHashMap` CME | `AccessOrderTracker` 统一使用 `ReentrantLock` |
+| 6 | DelayQueue 路径过期清理不减少 `currentWeight`，`weightedSize` 单调递增 | 改用 `int[1]` 捕获 weight 后再 `addAndGet(-weight)` |
+
+---
+
 ## 注意事项
 
 1. **线程安全**：所有公共方法都是线程安全的
 2. **内存管理**：缓存会自动清理过期项，但建议在应用结束时调用 `shutdown()` 释放后台线程
-3. **LRU 实现**：分片锁破坏全局 LRU 严格性，段内严格、段间近似。如需严格 LRU 顺序请使用 `shardedLocks(false)`
+3. **LRU 实现**：分片 LRU 是段内严格、段间近似（性能换精度的取舍）。如需严格全局 LRU 顺序，请使用 `shardedLocks(false)` 关闭分片
 4. **滑动 TTL**：启用 `expireAfterAccess` 后，每次 get 命中会有一次原子 `replace` 开销
 5. **过期时间单位**：所有时间相关配置使用 `Duration`，内部统一以纳秒存储
+6. **RemovalListener 执行点**：`RemovalListener` 在段锁内被同步调用，慢 listener 会阻塞同段其他 put / evict 路径。建议将重活（IO、日志）异步化或使用专门的清理线程
+7. **自定义 Expiry / Weigher 异常**：若用户回调抛异常，会向上传播至调用方且当前条目不会写入。生产环境请在回调内自行 try-catch
 
 ---
 
