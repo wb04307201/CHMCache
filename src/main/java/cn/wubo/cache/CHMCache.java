@@ -1,313 +1,644 @@
-
 package cn.wubo.cache;
 
-import java.util.*;
-import java.util.concurrent.*;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.DelayQueue;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Function;
+import java.util.function.Predicate;
+
+import cn.wubo.cache.internal.HotKeySampler;
+import cn.wubo.cache.internal.LatencyHistogram;
 
 /**
- * 一个基于 ConcurrentHashMap 和 LRU 策略的高性能缓存实现。
- * 支持自动过期、大小限制、LRU 淘汰、后台清理等特性。
+ * 基于 {@link ConcurrentHashMap} 与 LRU 策略的高性能缓存实现。Caffeine 风格 API。
+ *
+ * <h2>核心设计</h2>
+ * <ul>
+ *   <li>三个数据结构协同：{@code ConcurrentHashMap}（无锁读写）+ 分片
+ *       {@link AccessOrderTracker}（按 key hash 分桶，每桶独立 lock）+ {@link DelayQueue}（显式到期项）</li>
+ *   <li>每条缓存项携带唯一 token，{@link DelayedItem} 到期回收时通过
+ *       {@link ConcurrentHashMap#computeIfPresent} 做原子校验，避免误删新值</li>
+ *   <li>{@code put} 路径同步触发 LRU 淘汰，避免 size 超出 {@code maximumSize}</li>
+ *   <li>TTL 基于 {@link System#nanoTime()} 单调时钟</li>
+ *   <li>后台清理线程（{@code daemon}）包 {@code try-catch}，异常不会静默取消后续调度</li>
+ *   <li>{@link #shutdown()} 幂等</li>
+ * </ul>
+ *
+ * @param <K> 键类型（非 null）
+ * @param <V> 值类型
  */
-public class CHMCache<K, V> {
+public final class CHMCache<K, V> {
 
-    // 主缓存存储：使用 ConcurrentHashMap 存储键值对和过期时间
+    private final String name;
     private final ConcurrentHashMap<K, CacheValue<V>> cacheMap;
-
-    // 访问顺序链表：用于维护访问顺序，实现 LRU 淘汰策略
-    private final LinkedHashMap<K, Long> accessOrderMap;
-    private final ReentrantLock lruLock = new ReentrantLock(); // LRU 操作的锁
-
-    // 延迟队列：用于处理明确过期项（基于 DelayQueue 实现）
+    private final AccessOrderTracker<K> accessOrder;
     private final DelayQueue<DelayedItem<K>> expirationQueue;
+    private final AtomicLong tokenGenerator = new AtomicLong(0L);
 
-    // 缓存配置参数
-    private final int maxSize; // 最大缓存大小
-    private final long defaultTtlMillis; // 默认 TTL（毫秒）
-    private final Random ttlRandom; // 用于随机化 TTL 的随机数生成器
+    private final Expiration<? super K, ? super V> expiration;
+    private final Expiry<? super K, ? super V> customExpiry;
+    private final Eviction eviction;
+    private final Weigher<? super K, ? super V> weigher;
+    private final RemovalListener<? super K, ? super V> removalListener;
+    private final long maxSizeOrWeight;
+    private final boolean isWeightBased;
+    private final boolean recordStats;
+    private final boolean slidingTtl;
 
-    // 监控指标统计
-    private final AtomicLong hitCount = new AtomicLong(0); // 命中次数
-    private final AtomicLong missCount = new AtomicLong(0); // 未命中次数
-    private final AtomicLong evictionCount = new AtomicLong(0); // 淘汰次数
-    private final AtomicLong cleanupTimeNanos = new AtomicLong(0); // 清理耗时（纳秒）
+    // 计数器
+    private final LongAdder hitCount = new LongAdder();
+    private final LongAdder missCount = new LongAdder();
+    private final LongAdder evictionCount = new LongAdder();
+    private final LongAdder expirationCount = new LongAdder();
+    private final LongAdder loadCount = new LongAdder();
+    private final LongAdder loadFailureCount = new LongAdder();
+    private final AtomicLong totalLoadTimeNanos = new AtomicLong(0);
+    private final AtomicLong cleanupTimeNanos = new AtomicLong(0);
+    private final AtomicLong cleanupRunCount = new AtomicLong(0);
+    private final AtomicLong currentWeight = new AtomicLong(0);
+    private final AtomicLong sizeWatermark = new AtomicLong(0);
 
-    // 清理线程池：用于定期执行清理任务
+    // recordStats 才启用
+    private final LatencyHistogram getLatency;
+    private final HotKeySampler<K> hotKeySampler;
+
+    // refreshAfterWrite 模式
+    private final Duration refreshAfterWrite;
+    private final ConcurrentHashMap<K, RefreshLoader<K, V>> refreshLoaders;
+
+    // 后台
     private final ScheduledExecutorService cleanupExecutor;
+    private final AtomicBoolean shutdown = new AtomicBoolean(false);
+    private final AsyncRefresher<K, V> asyncRefresher;
 
-    /**
-     * 默认构造函数，使用默认的缓存大小1000和默认的 TTL 60秒
-     */
-    public CHMCache() {
-        this(1000, 60_000, TimeUnit.MILLISECONDS);
-    }
-
-    /**
-     * 构造函数，初始化缓存配置和数据结构
-     * @param maxSize 缓存最大大小
-     * @param defaultTtlMillis 默认过期时间（毫秒）
-     */
-    public CHMCache(int maxSize, long defaultTtlMillis) {
-        this(maxSize, defaultTtlMillis, TimeUnit.MILLISECONDS);
-    }
-
-    /**
-     * 构造函数，初始化缓存配置和数据结构
-     * @param maxSize 缓存最大大小
-     * @param defaultTtlMillis 默认过期时间（毫秒）
-     * @param unit 时间单位
-     */
-    public CHMCache(int maxSize, long defaultTtlMillis, TimeUnit unit) {
-        this.maxSize = maxSize;
-        this.defaultTtlMillis = unit.toMillis(defaultTtlMillis);
-        this.ttlRandom = new Random();
-        this.cacheMap = new ConcurrentHashMap<>();
-        this.accessOrderMap = new LinkedHashMap<>(16, 0.75f, true); // accessOrder=true 表示按访问顺序排序
+    CHMCache(CHMCacheBuilder<K, V> b) {
+        this.name = b.name();
+        this.expiration = b.resolveExpiration();
+        this.customExpiry = b.resolveExpiry();
+        this.weigher = b.weigher();
+        this.removalListener = b.removalListener();
+        this.recordStats = b.isRecordStats();
+        this.isWeightBased = b.maximumWeight() > 0;
+        this.maxSizeOrWeight = isWeightBased ? b.maximumWeight() : b.maximumSize();
+        this.eviction = b.resolveEviction();
+        this.slidingTtl = b.slidingTtl() || customExpiry != null;
+        this.refreshAfterWrite = b.refreshAfterWriteDuration();
+        this.refreshLoaders = refreshAfterWrite != null ? new ConcurrentHashMap<>() : null;
+        int initialCap = Math.max(16, (int) Math.ceil(maxSizeOrWeight / 0.75f) + 1);
+        this.cacheMap = new ConcurrentHashMap<>(initialCap);
+        this.accessOrder = new AccessOrderTracker<>(b.shardedLocks() ? 16 : 1);
         this.expirationQueue = new DelayQueue<>();
-        this.cleanupExecutor = Executors.newSingleThreadScheduledExecutor();
-
-        // 启动后台清理线程
-        startCleanupThread();
+        this.getLatency = recordStats ? new LatencyHistogram() : null;
+        this.hotKeySampler = recordStats ? new HotKeySampler<>() : null;
+        this.asyncRefresher = new AsyncRefresher<>(b.executor());
+        this.cleanupExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "chmcache-cleanup-" + name);
+            t.setDaemon(true);
+            return t;
+        });
+        startCleanupThread(b.cleanupInterval());
     }
 
-    /**
-     * 启动后台定时清理线程，定期执行清理任务
-     */
-    private void startCleanupThread() {
-        cleanupExecutor.scheduleAtFixedRate(() -> {
-            long start = System.nanoTime();
-            int cleaned = 0;
-
-            // 处理延迟队列中的过期项
-            while (true) {
-                DelayedItem<K> delayedItem = expirationQueue.poll();
-                if (delayedItem == null) {
-                    break;
-                }
-                cleaned++;
-                cacheMap.remove(delayedItem.key);
-                accessOrderMap.remove(delayedItem.key);
-            }
-
-            // 随机采样清理过期项（惰性删除的一部分）
-            int sampleSize = Math.min(100, cacheMap.size() / 10);
-            if (sampleSize > 0) {
-                List<K> samples = new ArrayList<>(cacheMap.keySet());
-                Collections.shuffle(samples);
-                for (int i = 0; i < Math.min(sampleSize, samples.size()); i++) {
-                    K key = samples.get(i);
-                    CacheValue<V> cacheValue = cacheMap.get(key);
-                    if (cacheValue != null && cacheValue.isExpired()) {
-                        cacheMap.remove(key);
-                        accessOrderMap.remove(key);
-                        cleaned++;
-                    }
-                }
-            }
-
-            // LRU清理（如果超过大小限制）
-            if (cacheMap.size() > maxSize) {
-                cleaned += enforceLRU();
-            }
-
-            if (cleaned > 0) {
-                cleanupTimeNanos.addAndGet(System.nanoTime() - start);
-            }
-        }, 1, 1, TimeUnit.SECONDS); // 每秒执行一次清理
+    private void startCleanupThread(Duration interval) {
+        long periodMs = Math.max(1L, interval.toMillis());
+        cleanupExecutor.scheduleAtFixedRate(this::backgroundCleanupSafely,
+                periodMs, periodMs, TimeUnit.MILLISECONDS);
     }
 
-    /**
-     * 强制执行 LRU 淘汰策略，移除最近最少使用的缓存项
-     * @return 被移除的缓存项数量
-     */
-    private int enforceLRU() {
-        lruLock.lock();
-        try {
-            int removed = 0;
-            Iterator<Map.Entry<K, Long>> iterator = accessOrderMap.entrySet().iterator();
-            while (cacheMap.size() > maxSize && iterator.hasNext()) {
-                Map.Entry<K, Long> entry = iterator.next();
-                K key = entry.getKey();
-                if (cacheMap.remove(key) != null) {
-                    iterator.remove();
-                    removed++;
-                    evictionCount.incrementAndGet();
-                }
-            }
-            return removed;
-        } finally {
-            lruLock.unlock();
-        }
+    // ============================================================
+    // 静态工厂
+    // ============================================================
+
+    public static <K, V> CHMCacheBuilder<K, V> newBuilder() {
+        return new CHMCacheBuilder<>();
     }
 
-    /**
-     * 随机化 TTL（在默认 TTL 基础上 ±20%）
-     * @return 随机化的 TTL 值
-     */
-    private long getRandomizedTtl() {
-        double factor = 0.8 + 0.4 * ttlRandom.nextDouble(); // 0.8-1.2范围
-        return (long) (defaultTtlMillis * factor);
-    }
+    // ============================================================
+    // 基础 CRUD
+    // ============================================================
 
-    /**
-     * 添加缓存项，默认使用随机 TTL
-     * @param key 键
-     * @param value 值
-     */
     public void put(K key, V value) {
-        put(key, value, getRandomizedTtl());
+        validateKey(key);
+        // D10: expireAfterAccess 模式下，put 也是"访问"，应触发 TTL 续期
+        long ttlNanos = computeTtl(key, value, true, slidingTtl);
+        doPut(key, value, ttlNanos);
+    }
+
+    public void put(K key, V value, Duration ttl) {
+        validateKey(key);
+        Objects.requireNonNull(ttl, "ttl");
+        long ttlNanos = ttl.toNanos();
+        if (ttlNanos <= 0) throw new IllegalArgumentException("ttl must be positive");
+        doPut(key, value, ttlNanos);
     }
 
     /**
-     * 添加缓存项，指定 TTL
-     * @param key 键
-     * @param value 值
-     * @param ttlMillis 过期时间（毫秒）
+     * 真正的 put 逻辑。显式 TTL 的 put 不会触发 sliding refresh。
      */
-    public void put(K key, V value, long ttlMillis) {
-        put(key, value, ttlMillis, TimeUnit.MILLISECONDS);
-    }
+    private void doPut(K key, V value, long ttlNanos) {
+        long token = tokenGenerator.incrementAndGet();
+        long expireNanos = System.nanoTime() + ttlNanos;
+        int weight = Math.max(1, weigher.weigh(key, value));
+        CacheValue<V> cv = new CacheValue<>(value, ttlNanos, token, weight);
 
-    /**
-     * 添加缓存项，指定 TTL
-     * @param key 键
-     * @param value 值
-     * @param ttlMillis 过期时间（毫秒）
-     * @param unit 时间单位
-     */
-    public void put(K key, V value, long ttlMillis, TimeUnit unit) {
-        long millis = unit.toMillis(ttlMillis);
-        long expireTime = System.currentTimeMillis() + millis;
-        CacheValue<V> cacheValue = new CacheValue<>(value, millis);
-
-        // 添加到主缓存
-        cacheMap.put(key, cacheValue);
-
-        // 更新访问顺序
-        lruLock.lock();
-        try {
-            accessOrderMap.put(key, System.nanoTime());
-        } finally {
-            lruLock.unlock();
+        CacheValue<V> prior = cacheMap.put(key, cv);
+        if (prior != null) {
+            currentWeight.addAndGet(-prior.weight);
+            notifyRemoval(key, prior.value, RemovalCause.REPLACED);
         }
+        currentWeight.addAndGet(weight);
+        updateSizeWatermark();
 
-        // 添加到延迟队列
-        expirationQueue.put(new DelayedItem<>(key, expireTime));
+        accessOrder.touch(key);
+
+        expirationQueue.put(new DelayedItem<>(key, expireNanos, token));
+
+        evictIfNeeded();
     }
 
-    /**
-     * 获取缓存项
-     * @param key 键
-     * @return 值，如果不存在或已过期则返回 null
-     */
     public V get(K key) {
-        CacheValue<V> cacheValue = cacheMap.get(key);
+        return get(key, (CacheLoader<K, V>) null);
+    }
 
-        // 惰性删除：检查是否过期
-        if (cacheValue != null && cacheValue.isExpired()) {
-            cacheMap.remove(key);
-            accessOrderMap.remove(key);
-            missCount.incrementAndGet();
-            return null;
-        }
-
-        if (cacheValue != null) {
-            hitCount.incrementAndGet();
-            // 更新访问顺序
-            lruLock.lock();
-            try {
-                accessOrderMap.put(key, System.nanoTime());
-            } finally {
-                lruLock.unlock();
+    public V get(K key, CacheLoader<K, V> loader) {
+        validateKey(key);
+        // D17: 延迟采样只覆盖"缓存本身的查找/过期"路径，loader 调用时间不计入 get.penalty
+        long startNs = recordStats ? System.nanoTime() : 0L;
+        V result;
+        try {
+            CacheValue<V> cv = cacheMap.get(key);
+            if (cv != null && cv.isExpired()) {
+                lazyExpireIfStillExpired(key, cv);
+                missCount.increment();
+                recordHotKey(key);
+                result = loadFromLoader(key, loader);
+            } else if (cv != null) {
+                hitCount.increment();
+                accessOrder.touch(key);
+                recordHotKey(key);
+                // 滑动 TTL 续期（仅当 get 命中）
+                if (slidingTtl) {
+                    refreshSlidingTtl(key, cv);
+                }
+                result = cv.value;
+            } else {
+                missCount.increment();
+                recordHotKey(key);
+                result = loadFromLoader(key, loader);
             }
-            return cacheValue.value;
+        } finally {
+            if (recordStats) {
+                getLatency.record(System.nanoTime() - startNs);
+            }
         }
+        return result;
+    }
 
-        missCount.incrementAndGet();
+    public boolean containsKey(K key) {
+        validateKey(key);
+        CacheValue<V> cv = cacheMap.get(key);
+        if (cv == null) return false;
+        if (cv.isExpired()) {
+            lazyExpireIfStillExpired(key, cv);
+            return false;
+        }
+        return true;
+    }
+
+    public V invalidate(K key) {
+        validateKey(key);
+        CacheValue<V> cv = cacheMap.remove(key);
+        accessOrder.remove(key);
+        if (cv != null) {
+            currentWeight.addAndGet(-cv.weight);
+            notifyRemoval(key, cv.value, RemovalCause.EXPLICIT);
+            return cv.value;
+        }
         return null;
     }
 
     /**
-     * 删除缓存项
-     * @param key 键
-     * @return 被删除的值，如果不存在则返回 null
+     * 按 key 谓词批量失效。
      */
-    public V remove(K key) {
-        CacheValue<V> cacheValue = cacheMap.remove(key);
-        accessOrderMap.remove(key);
-        if (cacheValue != null) {
-            return cacheValue.value;
-        }
-        return null;
-    }
-
-    /**
-     * 清理所有过期项
-     */
-    public void cleanup() {
-        long start = System.nanoTime();
-        int cleaned = 0;
-
-        // 处理延迟队列
-        DelayedItem<K> delayedItem;
-        while ((delayedItem = expirationQueue.poll()) != null) {
-            cleaned++;
-            cacheMap.remove(delayedItem.key);
-            accessOrderMap.remove(delayedItem.key);
-        }
-
-        // 全面扫描清理
-        for (K key : new ArrayList<>(cacheMap.keySet())) {
-            CacheValue<V> cacheValue = cacheMap.get(key);
-            if (cacheValue != null && cacheValue.isExpired()) {
-                cacheMap.remove(key);
-                accessOrderMap.remove(key);
-                cleaned++;
+    public void invalidateIf(Predicate<? super K> predicate) {
+        Objects.requireNonNull(predicate, "predicate");
+        for (K key : cacheMap.keySet()) {
+            if (predicate.test(key)) {
+                invalidate(key);
             }
         }
-
-        // 执行LRU清理
-        cleaned += enforceLRU();
-
-        if (cleaned > 0) {
-            cleanupTimeNanos.addAndGet(System.nanoTime() - start);
-        }
     }
 
     /**
-     * 获取当前缓存大小
-     * @return 缓存项数量
+     * 清空全部。
      */
+    public void invalidateAll() {
+        for (Iterator<Map.Entry<K, CacheValue<V>>> it = cacheMap.entrySet().iterator(); it.hasNext(); ) {
+            Map.Entry<K, CacheValue<V>> e = it.next();
+            it.remove();
+            currentWeight.addAndGet(-e.getValue().weight);
+            notifyRemoval(e.getKey(), e.getValue().value, RemovalCause.EXPLICIT);
+        }
+        expirationQueue.clear();
+        accessOrder.clear();
+    }
+
     public int size() {
         return cacheMap.size();
     }
 
     /**
-     * 关闭缓存，停止清理线程
+     * 当前累计权重（仅 weight-based 模式有意义）。
      */
+    public long weightedSize() {
+        return currentWeight.get();
+    }
+
+    /**
+     * 同步 LRU 淘汰。该方法会调用 RemovalListener。
+     */
+    public void cleanup() {
+        performCleanup(true);
+    }
+
     public void shutdown() {
-        cleanupExecutor.shutdown();
-        try {
-            if (!cleanupExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+        if (shutdown.compareAndSet(false, true)) {
+            cleanupExecutor.shutdown();
+            try {
+                if (!cleanupExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                    cleanupExecutor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
                 cleanupExecutor.shutdownNow();
+                Thread.currentThread().interrupt();
             }
-        } catch (InterruptedException e) {
-            cleanupExecutor.shutdownNow();
-            Thread.currentThread().interrupt();
+        }
+    }
+
+    public boolean isShutdown() {
+        return shutdown.get();
+    }
+
+    // ============================================================
+    // 加载器
+    // ============================================================
+
+    public V computeIfAbsent(K key, Function<? super K, ? extends V> loader) {
+        Objects.requireNonNull(loader, "loader");
+        return get(key, k -> loader.apply(k));
+    }
+
+    public void refresh(K key, RefreshLoader<K, V> loader) {
+        validateKey(key);
+        Objects.requireNonNull(loader, "loader");
+        if (refreshAfterWrite != null) {
+            // 注册到 refreshLoaders，由后台扫描触发
+            refreshLoaders.put(key, loader);
+        } else {
+            // 未启用 refreshAfterWrite：立即异步刷新
+            asyncRefresher.refresh(this, key, loader);
         }
     }
 
     /**
-     * 获取监控指标
+     * 批量 get + 批量加载。缓存命中的 key 直接返回；未命中的 key 收集后由 bulkLoader
+     * 一次性加载并回填。
+     *
+     * @param keys      要获取的 key 集合
+     * @param bulkLoader 接收未命中 key 集合，返回对应的 Map&lt;K, V&gt;；返回 null 表示"无法加载"
      */
-    public MonitorMetrics getMetrics() {
-        return new MonitorMetrics(
-                hitCount.get(),
-                missCount.get(),
-                evictionCount.get(),
+    public java.util.Map<K, V> getAll(java.util.Set<? extends K> keys,
+                                      java.util.function.Function<java.util.Set<? extends K>, java.util.Map<? extends K, ? extends V>> bulkLoader) {
+        Objects.requireNonNull(keys, "keys");
+        Objects.requireNonNull(bulkLoader, "bulkLoader");
+        java.util.Map<K, V> result = new java.util.HashMap<>(keys.size() * 2);
+        java.util.Set<K> missing = new java.util.HashSet<>();
+        for (K key : keys) {
+            validateKey(key);
+            CacheValue<V> cv = cacheMap.get(key);
+            if (cv != null && cv.isExpired()) {
+                lazyExpireIfStillExpired(key, cv);
+                missCount.increment();
+                missing.add(key);
+            } else if (cv != null) {
+                hitCount.increment();
+                accessOrder.touch(key);
+                if (slidingTtl) refreshSlidingTtl(key, cv);
+                result.put(key, cv.value);
+            } else {
+                missCount.increment();
+                missing.add(key);
+            }
+        }
+        if (!missing.isEmpty()) {
+            java.util.Map<? extends K, ? extends V> loaded = bulkLoader.apply(missing);
+            if (loaded != null) {
+                for (java.util.Map.Entry<? extends K, ? extends V> e : loaded.entrySet()) {
+                    K key = e.getKey();
+                    V value = e.getValue();
+                    if (value != null) {
+                        put(key, value);
+                        result.put(key, value);
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    private V loadFromLoader(K key, CacheLoader<K, V> loader) {
+        if (loader == null) return null;
+        long start = System.nanoTime();
+        try {
+            V loaded = loader.load(key);
+            // 修复 Bug 4:loadCount 仅在 loader 返回非 null 时累加
+            // (与 CacheStats.loadFailureRate 注释"不含返回 null 的情况"保持一致)
+            if (loaded != null) {
+                loadCount.increment();
+                put(key, loaded);
+            }
+            return loaded;
+        } catch (Exception e) {
+            loadFailureCount.increment();
+            throw new RuntimeException("CacheLoader threw for key=" + key, e);
+        } finally {
+            totalLoadTimeNanos.addAndGet(System.nanoTime() - start);
+        }
+    }
+
+    // ============================================================
+    // 观测
+    // ============================================================
+
+    /**
+     * 轻量指标快照。始终可用。
+     */
+    public CacheMetrics metrics() {
+        return new CacheMetrics(
+                cacheMap.size(),
+                hitCount.sum(),
+                missCount.sum(),
+                evictionCount.sum(),
+                expirationCount.sum(),
                 cleanupTimeNanos.get(),
-                cacheMap.size()
+                cleanupRunCount.get()
         );
+    }
+
+    /**
+     * 详细指标快照。仅当 {@link CHMCacheBuilder#recordStats()} 时返回有效数据。
+     */
+    public CacheStats stats() {
+        long avgNs = 0L, minNs = 0L, maxNs = 0L;
+        if (getLatency != null && getLatency.totalCount() > 0) {
+            avgNs = (long) getLatency.averageNanos();
+            minNs = getLatency.minNanos();
+            maxNs = getLatency.maxNanos();
+        }
+        return new CacheStats(
+                hitCount.sum(),
+                missCount.sum(),
+                loadCount.sum(),
+                loadFailureCount.sum(),
+                evictionCount.sum(),
+                expirationCount.sum(),
+                totalLoadTimeNanos.get(),
+                avgNs,
+                minNs,
+                maxNs,
+                sizeWatermark.get()
+        );
+    }
+
+    public String getName() { return name; }
+
+    // ============================================================
+    // 内部：惰性过期、淘汰、清理
+    // ============================================================
+
+    private void refreshSlidingTtl(K key, CacheValue<V> cv) {
+        // D1: 先准备好新的 CacheValue 但不分配 token；如果 replace 失败则不分配 token，
+        //     避免残留幽灵 DelayedItem。
+        long now = System.nanoTime();
+        long newTtlNanos = computeTtl(key, cv.value, false, true);
+        long newToken = tokenGenerator.incrementAndGet();
+        CacheValue<V> refreshed = new CacheValue<>(cv.value, newTtlNanos, newToken, cv.weight);
+        if (cacheMap.replace(key, cv, refreshed)) {
+            expirationQueue.put(new DelayedItem<>(key, now + newTtlNanos, newToken));
+        }
+        // 替换失败（并发 put/invalidate）：放弃本次新 token，下次 get 重新触发
+    }
+
+    private void lazyExpireIfStillExpired(K key, CacheValue<V> cv) {
+        boolean[] removed = {false};
+        cacheMap.computeIfPresent(key, (k, v) -> {
+            if (v.token == cv.token && v.isExpired()) {
+                removed[0] = true;
+                return null;
+            }
+            return v;
+        });
+        if (removed[0]) {
+            expirationCount.increment();
+            accessOrder.remove(key);
+            currentWeight.addAndGet(-cv.weight);
+            notifyRemoval(key, cv.value, RemovalCause.EXPIRED);
+        }
+    }
+
+    private void evictIfNeeded() {
+        if (eviction.shouldEvict(cacheMap.size(), isWeightBased ? -1 : maxSizeOrWeight,
+                currentWeight.get(), isWeightBased ? maxSizeOrWeight : -1)) {
+            doEvict();
+        }
+    }
+
+    private void doEvict() {
+        // D7: while 循环直到 size 满足约束（多段场景下，单次遍历可能淘汰不够）
+        while (true) {
+            int targetEvictions = computeEvictionCount();
+            if (targetEvictions <= 0) return;
+            int evicted = 0;
+            for (int stripe = 0; stripe < accessOrder.stripeCount() && evicted < targetEvictions; stripe++) {
+                LinkedHashMap<K, Boolean> seg = accessOrder.segmentAt(stripe);
+                // 修复 Bug 5:必须使用与 touch/remove 一致的 ReentrantLock,
+                // 否则 synchronized 与 ReentrantLock 不互斥,LinkedHashMap.iterator() 抛 CME
+                ReentrantLock stripeLock = accessOrder.stripedLocks().lockFor(stripe);
+                stripeLock.lock();
+                try {
+                    Iterator<Map.Entry<K, Boolean>> it = seg.entrySet().iterator();
+                    while (it.hasNext() && evicted < targetEvictions) {
+                        Map.Entry<K, Boolean> e = it.next();
+                        K key = e.getKey();
+                        CacheValue<V> removed = cacheMap.remove(key);
+                        it.remove();
+                        if (removed != null) {
+                            currentWeight.addAndGet(-removed.weight);
+                            notifyRemoval(key, removed.value,
+                                    isWeightBased ? RemovalCause.WEIGHT : RemovalCause.SIZE);
+                            evictionCount.increment();
+                            evicted++;
+                        }
+                    }
+                } finally {
+                    stripeLock.unlock();
+                }
+            }
+            // 防止无限循环：CAS 失败（外部 put 又超出）或一轮没淘汰任何东西
+            if (evicted == 0) return;
+        }
+    }
+
+    private int computeEvictionCount() {
+        if (isWeightBased) {
+            long excess = currentWeight.get() - maxSizeOrWeight;
+            return excess <= 0 ? 0 : (int) Math.min(excess, 1024);
+        } else {
+            int excess = cacheMap.size() - (int) maxSizeOrWeight;
+            return Math.max(0, Math.min(excess, 1024));
+        }
+    }
+
+    private void backgroundCleanupSafely() {
+        try {
+            performCleanup(false);
+        } catch (Throwable t) {
+            t.printStackTrace();
+        }
+    }
+
+    private void performCleanup(boolean fullScan) {
+        long start = System.nanoTime();
+        try {
+            // 排空延迟队列
+            while (true) {
+                DelayedItem<K> item = expirationQueue.poll();
+                if (item == null) break;
+                boolean[] removed = {false};
+                int[] removedWeight = {0};
+                cacheMap.computeIfPresent(item.key, (k, v) -> {
+                    if (v.token == item.token) {
+                        removed[0] = true;
+                        removedWeight[0] = v.weight;
+                        return null;
+                    }
+                    return v;
+                });
+                if (removed[0]) {
+                    expirationCount.increment();
+                    // 修复 Bug 6:通过 DelayQueue 路径移除的过期项也必须减少 currentWeight,
+                    // 否则 weight-based 模式下 weightedSize 会单调递增,破坏不变量
+                    currentWeight.addAndGet(-removedWeight[0]);
+                }
+            }
+            // D11: refreshAfterWrite 扫描 — 写后达到 refreshAfterWrite 的 key 触发后台异步刷新
+            if (refreshAfterWrite != null && !refreshLoaders.isEmpty()) {
+                long refreshAfterNanos = refreshAfterWrite.toNanos();
+                long now = System.nanoTime();
+                for (K key : refreshLoaders.keySet()) {
+                    CacheValue<V> cv = cacheMap.get(key);
+                    if (cv == null) {
+                        // 已过期/淘汰，清掉 loader
+                        refreshLoaders.remove(key);
+                        continue;
+                    }
+                    if (now - cv.createTimeNanos >= refreshAfterNanos) {
+                        RefreshLoader<K, V> loader = refreshLoaders.get(key);
+                        if (loader != null) {
+                            asyncRefresher.refresh(this, key, loader);
+                        }
+                    }
+                }
+            }
+            // 全量/采样扫描
+            if (fullScan) {
+                for (K key : cacheMap.keySet()) {
+                    tryExpireKey(key);
+                }
+            } else {
+                int size = cacheMap.size();
+                if (size > 0) {
+                    int sampleSize = Math.min(100, Math.max(1, size / 10));
+                    List<K> samples = new ArrayList<>(cacheMap.keySet());
+                    Collections.shuffle(samples, ThreadLocalRandom.current());
+                    int n = Math.min(sampleSize, samples.size());
+                    for (int i = 0; i < n; i++) {
+                        tryExpireKey(samples.get(i));
+                    }
+                }
+            }
+            // LRU 兜底
+            evictIfNeeded();
+        } finally {
+            cleanupTimeNanos.addAndGet(System.nanoTime() - start);
+            cleanupRunCount.incrementAndGet();
+        }
+    }
+
+    private void tryExpireKey(K key) {
+        CacheValue<V> cv = cacheMap.get(key);
+        if (cv != null && cv.isExpired()) {
+            lazyExpireIfStillExpired(key, cv);
+        }
+    }
+
+    private void notifyRemoval(K key, V value, RemovalCause cause) {
+        if (removalListener != null) {
+            try {
+                removalListener.onRemoval(key, value, cause);
+            } catch (Throwable t) {
+                t.printStackTrace();
+            }
+        }
+    }
+
+    private void recordHotKey(K key) {
+        if (hotKeySampler != null) hotKeySampler.record(key);
+    }
+
+    private void updateSizeWatermark() {
+        long s = cacheMap.size();
+        long prev;
+        do {
+            prev = sizeWatermark.get();
+            if (s <= prev) return;
+        } while (!sizeWatermark.compareAndSet(prev, s));
+    }
+
+    private long computeTtl(K key, V value, boolean isCreate, boolean isRead) {
+        long now = System.nanoTime();
+        if (customExpiry != null) {
+            Duration d;
+            // isCreate 优先于 isRead:put 路径必须触发 expireAfterCreate
+            // (修复 Bug:sliding TTL 模式下 put 被误判为 read,导致 expireAfterCreate 永不调用)
+            if (isCreate) d = customExpiry.expireAfterCreate(key, value, now);
+            else if (isRead) d = customExpiry.expireAfterRead(key, value, now);
+            else d = customExpiry.expireAfterUpdate(key, value, now);
+            return Math.max(0L, d.toNanos());
+        }
+        Duration d;
+        if (isCreate) d = expiration.expireAfterCreate(key, value, now);
+        else if (isRead) d = expiration.expireAfterRead(key, value, now);
+        else d = expiration.expireAfterUpdate(key, value, now);
+        return Math.max(0L, d.toNanos());
+    }
+
+    private static <K> void validateKey(K key) {
+        if (key == null) throw new NullPointerException("key must not be null");
     }
 }
