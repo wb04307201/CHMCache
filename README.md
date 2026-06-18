@@ -1,6 +1,6 @@
-# CHMCache - 基于 ConcurrentHashMap 的 Caffeine 风格缓存实现
+# CHMCache
 
-一个基于 `ConcurrentHashMap` 的高性能缓存库，提供 **Caffeine 风格的 API**，支持自动过期、LRU 淘汰、权重淘汰、事件回调、加载器、Micrometer 集成等特性。
+> 一个基于 `ConcurrentHashMap` 的高性能缓存库，提供 **Caffeine 风格的 API**，支持自动过期、LRU 淘汰、权重淘汰、事件回调、加载器等特性。
 
 [![](https://jitpack.io/v/io.github.wb04307201/CHMCache.svg)](https://jitpack.io/#io.github.wb04307201/CHMCache)
 
@@ -12,31 +12,18 @@
 - **事件回调**：`RemovalListener` 区分 7 种 `RemovalCause`
 - **加载器模式**：`get(K, CacheLoader)`、`computeIfAbsent`、`getAll(批量加载)`、异步 `refresh`
 - **观测能力**：`CacheMetrics`（始终可用）+ `CacheStats`（recordStats 后可用，含延迟分桶与热点 Key 采样）
-- **Micrometer 集成**：`CHMCacheMetricsBinder` 一键发布到 `MeterRegistry`
 - **分片 LRU**（默认 16 段）：每段独立 `ReentrantLock` + `LinkedHashMap(accessOrder=true)`，段内严格 LRU、段间近似
 - **Java 17 干净实现**：基于 `ConcurrentHashMap` + 分片 `LinkedHashMap` + `DelayQueue`，零三方核心依赖
 
 ---
 
-## 引入
-
-### Maven（推荐）
+## 引入依赖
 
 ```xml
 <dependency>
     <groupId>io.github.wb04307201</groupId>
     <artifactId>CHMCache</artifactId>
-    <version>2.0.0</version>
-</dependency>
-```
-
-### Micrometer 集成（可选）
-
-```xml
-<dependency>
-    <groupId>io.micrometer</groupId>
-    <artifactId>micrometer-core</artifactId>
-    <version>1.13.4</version>
+    <version>1.0.0</version>
 </dependency>
 ```
 
@@ -154,30 +141,6 @@ s.evictionCount();
 s.sizeWatermark();
 ```
 
-### 4. Micrometer 集成
-
-```java
-import cn.wubo.cache.internal.CHMCacheMetricsBinder;
-import io.micrometer.core.instrument.MeterRegistry;
-import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
-
-MeterRegistry registry = new SimpleMeterRegistry();
-new CHMCacheMetricsBinder(cache).bindTo(registry);
-
-// 注册的指标：
-//   chmcache.{name}.size       (Gauge)
-//   chmcache.{name}.hit        (Counter)
-//   chmcache.{name}.miss       (Counter)
-//   chmcache.{name}.eviction   (Counter)
-//   chmcache.{name}.expiration (Counter)
-//   chmcache.{name}.get.penalty (Timer)
-
-// 周期调用 publish() 将 cache 内部计数器的差值推送到 Micrometer
-scheduler.scheduleAtFixedRate(
-    () -> new CHMCacheMetricsBinder(cache).publish(),
-    0, 10, TimeUnit.SECONDS);
-```
-
 ---
 
 ## Builder 完整配置
@@ -208,7 +171,7 @@ scheduler.scheduleAtFixedRate(
 | 过期 | `expireAfterWrite` | `expireAfterAccess`（滑动） | `expireAfter`（自定义） |
 | 失效 | `invalidate(K)` | `invalidateIf(Predicate)` | `invalidateAll()` |
 | 加载 | `computeIfAbsent` | `get(K, CacheLoader)` | `refresh(K, RefreshLoader)` 异步 |
-| 观测 | `CacheMetrics`（轻量） | `CacheStats`（含延迟/热点） | `CHMCacheMetricsBinder` Micrometer |
+| 观测 | `CacheMetrics`（轻量） | `CacheStats`（含延迟/热点） | - |
 | 性能 | - | - | 分片锁（16 段） |
 | 事件 | - | `RemovalListener` + 7 种 `RemovalCause` | - |
 
@@ -257,7 +220,7 @@ Benchmark 覆盖：`getOnly` / `putOnly` / `mixed (90% get + 10% put)`，容量 
 - **TTL 单调时钟**：基于 `System.nanoTime()`，避免系统时钟回拨（NTP 校时）导致过期判断异常
 - **后台清理**：`daemon` 线程包 `try-catch`，异常不会静默取消后续调度；`shutdown()` 幂等
 - **分片 LRU**：段内严格 LRU，段间近似。文档化此权衡，与 Caffeine 同样的取舍
-- **零三方核心依赖**：Micrometer / Caffeine / Guava 全部 `<optional>true</optional>`
+- **零三方核心依赖**：Caffeine / Guava 全部 `<optional>true</optional>`（仅 benchmark 用）
 
 ---
 

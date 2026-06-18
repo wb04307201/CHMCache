@@ -59,7 +59,7 @@ public final class CHMCacheBuilder<K, V> {
     public Duration refreshAfterWriteDuration() { return refreshAfterWriteDuration; }
 
     /**
-     * 设置缓存实例名称。用于 Micrometer 集成时的指标前缀，默认 "default"。
+     * 设置缓存实例名称。默认 "default"。
      */
     public CHMCacheBuilder<K, V> name(String name) {
         this.name = Objects.requireNonNull(name, "name");

@@ -263,7 +263,7 @@ class AdvancedProbeRound5Test {
     }
 
     @Test
-    @DisplayName("E4-4: builder 自定义 name 生效,且 Micrometer 集成可用")
+    @DisplayName("E4-4: builder 自定义 name 生效,getName() 正确返回")
     void probe_E4_custom_name_meter() {
         CHMCache<String, String> cache = CHMCache.<String, String>newBuilder()
                 .maximumSize(10)
