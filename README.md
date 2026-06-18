@@ -2,7 +2,7 @@
 
 一个基于 `ConcurrentHashMap` 的高性能缓存库，提供 **Caffeine 风格的 API**，支持自动过期、LRU 淘汰、权重淘汰、事件回调、加载器、Micrometer 集成等特性。
 
-[![](https://jitpack.io/v/com.gitee.wb04307201/CHMCache.svg)](https://jitpack.io/#com.gitee.wb04307201/CHMCache)
+[![](https://jitpack.io/v/io.github.wb04307201/CHMCache.svg)](https://jitpack.io/#io.github.wb04307201/CHMCache)
 
 ## 核心特性
 
@@ -24,7 +24,7 @@
 
 ```xml
 <dependency>
-    <groupId>com.gitee.wb04307201</groupId>
+    <groupId>io.github.wb04307201</groupId>
     <artifactId>CHMCache</artifactId>
     <version>2.0.0</version>
 </dependency>

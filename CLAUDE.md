@@ -6,11 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 CHMCache 是一个基于 `ConcurrentHashMap` 和 LRU 策略的 Java 缓存库。提供自动过期（TTL）、大小限制、LRU 淘汰、后台清理、监控指标等特性。
 
-- **Maven 坐标**: `com.gitee.wb04307201:CHMCache`
+- **Maven 坐标**: `io.github.wb04307201:CHMCache`
 - **Java 版本**: 17
 - **测试框架**: JUnit 5 (Jupiter) 5.13.4
 - **许可证**: Apache 2.0
-- **发布仓库**: JitPack（`com.gitee.wb04307201:CHMCache:<version>`）
+- **发布仓库**: JitPack（`io.github.wb04307201:CHMCache:<version>`）
 
 ## 常用命令
 
