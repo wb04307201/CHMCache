@@ -20,9 +20,12 @@ import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 import java.util.function.Predicate;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 import cn.wubo.cache.internal.HotKeySampler;
 import cn.wubo.cache.internal.LatencyHistogram;
+import cn.wubo.cache.internal.PerKeyStats;
 
 /**
  * 基于 {@link ConcurrentHashMap} 与 LRU 策略的高性能缓存实现。Caffeine 风格 API。
@@ -44,6 +47,8 @@ import cn.wubo.cache.internal.LatencyHistogram;
  */
 public final class CHMCache<K, V> {
 
+    private static final Logger LOG = Logger.getLogger(CHMCache.class.getName());
+
     private final String name;
     private final ConcurrentHashMap<K, CacheValue<V>> cacheMap;
     private final AccessOrderTracker<K> accessOrder;
@@ -55,6 +60,7 @@ public final class CHMCache<K, V> {
     private final Eviction eviction;
     private final Weigher<? super K, ? super V> weigher;
     private final RemovalListener<? super K, ? super V> removalListener;
+    private final CacheListener<? super K, ? super V> listener;
     private final long maxSizeOrWeight;
     private final boolean isWeightBased;
     private final boolean recordStats;
@@ -77,6 +83,9 @@ public final class CHMCache<K, V> {
     private final LatencyHistogram getLatency;
     private final HotKeySampler<K> hotKeySampler;
 
+    // enablePerKeyMetrics 才启用
+    private final ConcurrentHashMap<K, PerKeyStats> perKeyStatsMap;
+
     // refreshAfterWrite 模式
     private final Duration refreshAfterWrite;
     private final ConcurrentHashMap<K, RefreshLoader<K, V>> refreshLoaders;
@@ -86,12 +95,19 @@ public final class CHMCache<K, V> {
     private final AtomicBoolean shutdown = new AtomicBoolean(false);
     private final AsyncRefresher<K, V> asyncRefresher;
 
+    // 时钟源（默认 System::nanoTime；测试时可注入可控时钟）
+    private final java.util.function.LongSupplier nanoTimeSource;
+
+    // 不可变配置 record（构造后快照）
+    private final CHMCacheConfig<K, V> config;
+
     CHMCache(CHMCacheBuilder<K, V> b) {
         this.name = b.name();
         this.expiration = b.resolveExpiration();
         this.customExpiry = b.resolveExpiry();
         this.weigher = b.weigher();
         this.removalListener = b.removalListener();
+        this.listener = b.listener();
         this.recordStats = b.isRecordStats();
         this.isWeightBased = b.maximumWeight() > 0;
         this.maxSizeOrWeight = isWeightBased ? b.maximumWeight() : b.maximumSize();
@@ -105,13 +121,59 @@ public final class CHMCache<K, V> {
         this.expirationQueue = new DelayQueue<>();
         this.getLatency = recordStats ? new LatencyHistogram() : null;
         this.hotKeySampler = recordStats ? new HotKeySampler<>() : null;
+        this.perKeyStatsMap = b.isPerKeyMetrics() ? new ConcurrentHashMap<>() : null;
         this.asyncRefresher = new AsyncRefresher<>(b.executor());
+        this.nanoTimeSource = b.nanoTimeSource();
         this.cleanupExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "chmcache-cleanup-" + name);
             t.setDaemon(true);
             return t;
         });
         startCleanupThread(b.cleanupInterval());
+        this.config = new CHMCacheConfig<>(
+                name, b.maximumSize(), b.maximumWeight(), weigher,
+                eviction, expiration, customExpiry, b.cleanupInterval(),
+                removalListener, listener, recordStats, b.shardedLocks(),
+                slidingTtl, refreshAfterWrite, b.executor(), nanoTimeSource,
+                perKeyStatsMap != null);
+    }
+
+    /**
+     * 使用不可变配置 record 构造缓存实例。
+     *
+     * @param c 不可变配置（不可为 null）
+     * @since 1.1.0
+     */
+    CHMCache(CHMCacheConfig<K, V> c) {
+        this.name = c.name();
+        this.expiration = c.expiration();
+        this.customExpiry = c.expiry();
+        this.weigher = c.weigher();
+        this.removalListener = c.removalListener();
+        this.listener = c.listener();
+        this.recordStats = c.statsEnabled();
+        this.isWeightBased = c.maximumWeight() > 0;
+        this.maxSizeOrWeight = isWeightBased ? c.maximumWeight() : c.maximumSize();
+        this.eviction = c.eviction();
+        this.slidingTtl = c.slidingTtl() || customExpiry != null;
+        this.refreshAfterWrite = c.refreshAfterWriteDuration();
+        this.refreshLoaders = refreshAfterWrite != null ? new ConcurrentHashMap<>() : null;
+        int initialCap = Math.max(16, (int) Math.ceil(maxSizeOrWeight / 0.75f) + 1);
+        this.cacheMap = new ConcurrentHashMap<>(initialCap);
+        this.accessOrder = new AccessOrderTracker<>(c.shardedLocks() ? 16 : 1);
+        this.expirationQueue = new DelayQueue<>();
+        this.getLatency = recordStats ? new LatencyHistogram() : null;
+        this.hotKeySampler = recordStats ? new HotKeySampler<>() : null;
+        this.perKeyStatsMap = c.perKeyMetrics() ? new ConcurrentHashMap<>() : null;
+        this.asyncRefresher = new AsyncRefresher<>(c.executor());
+        this.nanoTimeSource = c.nanoTimeSource();
+        this.cleanupExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "chmcache-cleanup-" + name);
+            t.setDaemon(true);
+            return t;
+        });
+        startCleanupThread(c.cleanupInterval());
+        this.config = c;
     }
 
     private void startCleanupThread(Duration interval) {
@@ -152,21 +214,24 @@ public final class CHMCache<K, V> {
      */
     private void doPut(K key, V value, long ttlNanos) {
         long token = tokenGenerator.incrementAndGet();
-        long expireNanos = System.nanoTime() + ttlNanos;
+        long now = nanoTimeSource.getAsLong();
+        long expireNanos = now + ttlNanos;
         int weight = Math.max(1, weigher.weigh(key, value));
-        CacheValue<V> cv = new CacheValue<>(value, ttlNanos, token, weight);
+        CacheValue<V> cv = new CacheValue<>(value, ttlNanos, token, weight, nanoTimeSource);
 
         CacheValue<V> prior = cacheMap.put(key, cv);
         if (prior != null) {
             currentWeight.addAndGet(-prior.weight);
             notifyRemoval(key, prior.value, RemovalCause.REPLACED);
+            fireReplace(key, prior.value, value);
         }
         currentWeight.addAndGet(weight);
         updateSizeWatermark();
+        recordPut(key);
 
         accessOrder.touch(key);
 
-        expirationQueue.put(new DelayedItem<>(key, expireNanos, token));
+        expirationQueue.put(new DelayedItem<>(key, expireNanos, token, nanoTimeSource));
 
         evictIfNeeded();
     }
@@ -178,17 +243,21 @@ public final class CHMCache<K, V> {
     public V get(K key, CacheLoader<K, V> loader) {
         validateKey(key);
         // D17: 延迟采样只覆盖"缓存本身的查找/过期"路径，loader 调用时间不计入 get.penalty
-        long startNs = recordStats ? System.nanoTime() : 0L;
+        long startNs = recordStats ? nanoTimeSource.getAsLong() : 0L;
         V result;
         try {
             CacheValue<V> cv = cacheMap.get(key);
             if (cv != null && cv.isExpired()) {
                 lazyExpireIfStillExpired(key, cv);
                 missCount.increment();
+                recordMiss(key);
+                fireMiss(key);
                 recordHotKey(key);
                 result = loadFromLoader(key, loader);
             } else if (cv != null) {
                 hitCount.increment();
+                recordHit(key);
+                fireHit(key, cv.value);
                 accessOrder.touch(key);
                 recordHotKey(key);
                 // 滑动 TTL 续期（仅当 get 命中）
@@ -198,12 +267,14 @@ public final class CHMCache<K, V> {
                 result = cv.value;
             } else {
                 missCount.increment();
+                recordMiss(key);
+                fireMiss(key);
                 recordHotKey(key);
                 result = loadFromLoader(key, loader);
             }
         } finally {
             if (recordStats) {
-                getLatency.record(System.nanoTime() - startNs);
+                getLatency.record(nanoTimeSource.getAsLong() - startNs);
             }
         }
         return result;
@@ -334,14 +405,17 @@ public final class CHMCache<K, V> {
             if (cv != null && cv.isExpired()) {
                 lazyExpireIfStillExpired(key, cv);
                 missCount.increment();
+                recordMiss(key);
                 missing.add(key);
             } else if (cv != null) {
                 hitCount.increment();
+                recordHit(key);
                 accessOrder.touch(key);
                 if (slidingTtl) refreshSlidingTtl(key, cv);
                 result.put(key, cv.value);
             } else {
                 missCount.increment();
+                recordMiss(key);
                 missing.add(key);
             }
         }
@@ -363,7 +437,7 @@ public final class CHMCache<K, V> {
 
     private V loadFromLoader(K key, CacheLoader<K, V> loader) {
         if (loader == null) return null;
-        long start = System.nanoTime();
+        long start = nanoTimeSource.getAsLong();
         try {
             V loaded = loader.load(key);
             // 修复 Bug 4:loadCount 仅在 loader 返回非 null 时累加
@@ -371,13 +445,14 @@ public final class CHMCache<K, V> {
             if (loaded != null) {
                 loadCount.increment();
                 put(key, loaded);
+                fireLoad(key, loaded);
             }
             return loaded;
         } catch (Exception e) {
             loadFailureCount.increment();
             throw new RuntimeException("CacheLoader threw for key=" + key, e);
         } finally {
-            totalLoadTimeNanos.addAndGet(System.nanoTime() - start);
+            totalLoadTimeNanos.addAndGet(nanoTimeSource.getAsLong() - start);
         }
     }
 
@@ -427,6 +502,152 @@ public final class CHMCache<K, V> {
 
     public String getName() { return name; }
 
+    /** @return 不可变配置 record 快照，构造后不再变化 */
+    public CHMCacheConfig<K, V> config() { return config; }
+
+    // ============================================================
+    // Per-Key 统计
+    // ============================================================
+
+    private PerKeyStats statsFor(K key) {
+        if (perKeyStatsMap == null) return null;
+        return perKeyStatsMap.computeIfAbsent(key, k -> new PerKeyStats());
+    }
+
+    private void recordHit(K key) {
+        PerKeyStats s = statsFor(key);
+        if (s != null) {
+            s.hitCount.increment();
+            s.lastHitEpochMs.set(System.currentTimeMillis());
+        }
+    }
+
+    private void recordMiss(K key) {
+        PerKeyStats s = statsFor(key);
+        if (s != null) s.missCount.increment();
+    }
+
+    private void recordPut(K key) {
+        PerKeyStats s = statsFor(key);
+        if (s != null) {
+            s.putCount.increment();
+            s.lastPutEpochMs.set(System.currentTimeMillis());
+        }
+    }
+
+    private void recordEviction(K key) {
+        PerKeyStats s = statsFor(key);
+        if (s != null) s.evictionCount.increment();
+    }
+
+    private void recordExpiration(K key) {
+        PerKeyStats s = statsFor(key);
+        if (s != null) s.expirationCount.increment();
+    }
+
+    /**
+     * 返回指定 key 的统计快照。需 {@link CHMCacheBuilder#enablePerKeyMetrics(boolean)} 为 true。
+     *
+     * @param key 缓存 key
+     * @return 统计快照；未启用或 key 从未访问时返回 null
+     * @since 1.1.0
+     */
+    public KeyStatistics stats(K key) {
+        if (perKeyStatsMap == null) return null;
+        PerKeyStats s = perKeyStatsMap.get(key);
+        if (s == null) return null;
+        return new KeyStatistics(
+                key,
+                s.hitCount.sum(),
+                s.missCount.sum(),
+                s.putCount.sum(),
+                s.evictionCount.sum(),
+                s.expirationCount.sum(),
+                s.lastPutEpochMs.get(),
+                s.lastHitEpochMs.get()
+        );
+    }
+
+    /**
+     * 返回所有曾访问 key 的统计快照。需 {@link CHMCacheBuilder#enablePerKeyMetrics(boolean)} 为 true。
+     *
+     * <p>注意：此方法返回弱一致性快照，不同 key 的统计可能反映不同时间点。
+     *
+     * @return key -&gt; 统计快照 的不可变 Map；未启用时返回空 Map
+     * @since 1.1.0
+     */
+    public java.util.Map<K, KeyStatistics> allStats() {
+        if (perKeyStatsMap == null) return java.util.Collections.emptyMap();
+        java.util.Map<K, KeyStatistics> result = new java.util.HashMap<>(perKeyStatsMap.size());
+        for (java.util.Map.Entry<K, PerKeyStats> e : perKeyStatsMap.entrySet()) {
+            K k = e.getKey();
+            PerKeyStats s = e.getValue();
+            result.put(k, new KeyStatistics(
+                    k,
+                    s.hitCount.sum(),
+                    s.missCount.sum(),
+                    s.putCount.sum(),
+                    s.evictionCount.sum(),
+                    s.expirationCount.sum(),
+                    s.lastPutEpochMs.get(),
+                    s.lastHitEpochMs.get()
+            ));
+        }
+        return java.util.Collections.unmodifiableMap(result);
+    }
+
+    /**
+     * 触发一次指标导出。内部调用 {@link CacheMetricsExporter#exportMetrics} 与
+     * {@link CacheMetricsExporter#exportStats}，分别传入 {@link #metrics()} 和
+     * {@link #stats()}。
+     *
+     * <p>导出器抛出的异常会被吞掉，不会影响缓存功能（与监听器异常隔离一致）。</p>
+     *
+     * @param exporter 导出器实现（不可为 null）
+     * @throws NullPointerException 若 {@code exporter} 为 null
+     * @since 1.1.0
+     */
+    public void exportMetrics(CacheMetricsExporter exporter) {
+        Objects.requireNonNull(exporter, "exporter must not be null");
+        try {
+            exporter.exportMetrics(metrics());
+            exporter.exportStats(recordStats ? stats() : null);
+        } catch (Exception e) {
+            LOG.log(Level.WARNING, "[{0}] CacheMetricsExporter failed: {1}",
+                    new Object[]{name, e.getMessage()});
+        }
+    }
+
+    /**
+     * 触发一次统计持久化记录。内部调用 {@link CacheStatisticsSink#record}，
+     * 传入 {@link #metrics()} 和 {@link #stats()}。
+     *
+     * <p>与 {@link #exportMetrics(CacheMetricsExporter)} 的区别：
+     * <ul>
+     *   <li>{@code CacheMetricsExporter} — 一次性的指标导出（适合推送到 Prometheus / StatsD 等）</li>
+     *   <li>{@code CacheStatisticsSink} — 持续累积的持久化存储（适合写入数据库 / 时序数据库 / 日志文件）</li>
+     * </ul>
+     * 持久化 sink 抛出的异常会被吞掉，不会影响缓存功能。</p>
+     *
+     * <p>CHMCache 不会内置周期性 record 调度 —
+     * 需要周期性持久化时，请在外部使用 {@link java.util.concurrent.ScheduledExecutorService}
+     * 调用本方法。</p>
+     *
+     * @param sink 持久化 sink 实现（不可为 null）
+     * @throws NullPointerException 若 {@code sink} 为 null
+     * @see CacheStatisticsSink
+     * @since 1.1.0
+     */
+    public void recordStatistics(CacheStatisticsSink sink) {
+        Objects.requireNonNull(sink, "sink must not be null");
+        try {
+            sink.record(metrics(), recordStats ? stats() : null);
+        } catch (Exception e) {
+            LOG.log(Level.WARNING, "[{0}] CacheStatisticsSink failed: {1}",
+                    new Object[]{name, e.getMessage()});
+        }
+    }
+
     // ============================================================
     // 内部：惰性过期、淘汰、清理
     // ============================================================
@@ -434,12 +655,13 @@ public final class CHMCache<K, V> {
     private void refreshSlidingTtl(K key, CacheValue<V> cv) {
         // D1: 先准备好新的 CacheValue 但不分配 token；如果 replace 失败则不分配 token，
         //     避免残留幽灵 DelayedItem。
-        long now = System.nanoTime();
+        long now = nanoTimeSource.getAsLong();
         long newTtlNanos = computeTtl(key, cv.value, false, true);
         long newToken = tokenGenerator.incrementAndGet();
-        CacheValue<V> refreshed = new CacheValue<>(cv.value, newTtlNanos, newToken, cv.weight);
+        CacheValue<V> refreshed = new CacheValue<>(cv.value, newTtlNanos, newToken, cv.weight,
+                cv.createTimeNanos, now, nanoTimeSource);
         if (cacheMap.replace(key, cv, refreshed)) {
-            expirationQueue.put(new DelayedItem<>(key, now + newTtlNanos, newToken));
+            expirationQueue.put(new DelayedItem<>(key, now + newTtlNanos, newToken, nanoTimeSource));
         }
         // 替换失败（并发 put/invalidate）：放弃本次新 token，下次 get 重新触发
     }
@@ -455,9 +677,11 @@ public final class CHMCache<K, V> {
         });
         if (removed[0]) {
             expirationCount.increment();
+            recordExpiration(key);
             accessOrder.remove(key);
             currentWeight.addAndGet(-cv.weight);
             notifyRemoval(key, cv.value, RemovalCause.EXPIRED);
+            fireExpire(key, cv.value);
         }
     }
 
@@ -492,6 +716,8 @@ public final class CHMCache<K, V> {
                             notifyRemoval(key, removed.value,
                                     isWeightBased ? RemovalCause.WEIGHT : RemovalCause.SIZE);
                             evictionCount.increment();
+                            recordEviction(key);
+                            fireEvict(key, removed.value);
                             evicted++;
                         }
                     }
@@ -518,12 +744,12 @@ public final class CHMCache<K, V> {
         try {
             performCleanup(false);
         } catch (Throwable t) {
-            t.printStackTrace();
+            LOG.log(Level.WARNING, "[{0}] background cleanup failed", t);
         }
     }
 
     private void performCleanup(boolean fullScan) {
-        long start = System.nanoTime();
+        long start = nanoTimeSource.getAsLong();
         try {
             // 排空延迟队列
             while (true) {
@@ -531,25 +757,31 @@ public final class CHMCache<K, V> {
                 if (item == null) break;
                 boolean[] removed = {false};
                 int[] removedWeight = {0};
+                Object[] removedValue = {null};
                 cacheMap.computeIfPresent(item.key, (k, v) -> {
                     if (v.token == item.token) {
                         removed[0] = true;
                         removedWeight[0] = v.weight;
+                        removedValue[0] = v.value;
                         return null;
                     }
                     return v;
                 });
                 if (removed[0]) {
                     expirationCount.increment();
+                    recordExpiration(item.key);
                     // 修复 Bug 6:通过 DelayQueue 路径移除的过期项也必须减少 currentWeight,
                     // 否则 weight-based 模式下 weightedSize 会单调递增,破坏不变量
                     currentWeight.addAndGet(-removedWeight[0]);
+                    @SuppressWarnings("unchecked")
+                    V ev = (V) removedValue[0];
+                    fireExpire(item.key, ev);
                 }
             }
             // D11: refreshAfterWrite 扫描 — 写后达到 refreshAfterWrite 的 key 触发后台异步刷新
             if (refreshAfterWrite != null && !refreshLoaders.isEmpty()) {
                 long refreshAfterNanos = refreshAfterWrite.toNanos();
-                long now = System.nanoTime();
+                long now = nanoTimeSource.getAsLong();
                 for (K key : refreshLoaders.keySet()) {
                     CacheValue<V> cv = cacheMap.get(key);
                     if (cv == null) {
@@ -585,7 +817,7 @@ public final class CHMCache<K, V> {
             // LRU 兜底
             evictIfNeeded();
         } finally {
-            cleanupTimeNanos.addAndGet(System.nanoTime() - start);
+            cleanupTimeNanos.addAndGet(nanoTimeSource.getAsLong() - start);
             cleanupRunCount.incrementAndGet();
         }
     }
@@ -602,8 +834,57 @@ public final class CHMCache<K, V> {
             try {
                 removalListener.onRemoval(key, value, cause);
             } catch (Throwable t) {
-                t.printStackTrace();
+                LOG.log(Level.WARNING, "[{0}] removal listener threw for key={1} cause={2}",
+                        new Object[]{name, key, cause, t});
             }
+        }
+    }
+
+    private void fireHit(K key, V value) {
+        if (listener == null) return;
+        try { listener.onHit(key, value); } catch (Throwable t) {
+            LOG.log(Level.WARNING, "[{0}] CacheListener.onHit threw for key={1}",
+                    new Object[]{name, key, t});
+        }
+    }
+
+    private void fireMiss(K key) {
+        if (listener == null) return;
+        try { listener.onMiss(key); } catch (Throwable t) {
+            LOG.log(Level.WARNING, "[{0}] CacheListener.onMiss threw for key={1}",
+                    new Object[]{name, key, t});
+        }
+    }
+
+    private void fireLoad(K key, V value) {
+        if (listener == null) return;
+        try { listener.onLoad(key, value); } catch (Throwable t) {
+            LOG.log(Level.WARNING, "[{0}] CacheListener.onLoad threw for key={1}",
+                    new Object[]{name, key, t});
+        }
+    }
+
+    private void fireEvict(K key, V value) {
+        if (listener == null) return;
+        try { listener.onEvict(key, value); } catch (Throwable t) {
+            LOG.log(Level.WARNING, "[{0}] CacheListener.onEvict threw for key={1}",
+                    new Object[]{name, key, t});
+        }
+    }
+
+    private void fireExpire(K key, V value) {
+        if (listener == null) return;
+        try { listener.onExpire(key, value); } catch (Throwable t) {
+            LOG.log(Level.WARNING, "[{0}] CacheListener.onExpire threw for key={1}",
+                    new Object[]{name, key, t});
+        }
+    }
+
+    private void fireReplace(K key, V oldValue, V newValue) {
+        if (listener == null) return;
+        try { listener.onReplace(key, oldValue, newValue); } catch (Throwable t) {
+            LOG.log(Level.WARNING, "[{0}] CacheListener.onReplace threw for key={1}",
+                    new Object[]{name, key, t});
         }
     }
 
@@ -621,7 +902,7 @@ public final class CHMCache<K, V> {
     }
 
     private long computeTtl(K key, V value, boolean isCreate, boolean isRead) {
-        long now = System.nanoTime();
+        long now = nanoTimeSource.getAsLong();
         if (customExpiry != null) {
             Duration d;
             // isCreate 优先于 isRead:put 路径必须触发 expireAfterCreate
