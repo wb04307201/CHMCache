@@ -261,13 +261,13 @@ Benchmark 覆盖：`getOnly` / `putOnly` / `mixed (90% get + 10% put)`，容量 
 
 v2.0 **破坏向后兼容**。迁移清单：
 
-| v1.x | v2.0 |
-| --- | --- |
-| `new CHMCache<>()` / `new CHMCache<>(maxSize, ttl)` | `CHMCache.newBuilder().maximumSize(...).build()` |
-| `new CHMCache<>(maxSize, ttl, unit)` / `new CHMCache<>(maxSize, ttl, unit, cleanupInterval)` | Builder 链式调用 |
-| `put(k, v, long)` / `put(k, v, long, unit)` | `put(k, v, Duration.ofSeconds(...))` |
-| `cache.remove(k)` | `cache.invalidate(k)` |
-| `cache.clear()` | `cache.invalidateAll()` |
-| `cache.getMetrics().getHitCount()` | `cache.metrics().hitCount()` |
-| `cache.putIfAbsent(k, v)` | `cache.computeIfAbsent(k, key -> v)` |
-| `CacheLoader` 隐式存在 | `CacheLoader` / `RefreshLoader` 显式传入 |
+| v1.0                                                                                         | v1.2                                             |
+|----------------------------------------------------------------------------------------------|--------------------------------------------------|
+| `new CHMCache<>()` / `new CHMCache<>(maxSize, ttl)`                                          | `CHMCache.newBuilder().maximumSize(...).build()` |
+| `new CHMCache<>(maxSize, ttl, unit)` / `new CHMCache<>(maxSize, ttl, unit, cleanupInterval)` | Builder 链式调用                                     |
+| `put(k, v, long)` / `put(k, v, long, unit)`                                                  | `put(k, v, Duration.ofSeconds(...))`             |
+| `cache.remove(k)`                                                                            | `cache.invalidate(k)`                            |
+| `cache.clear()`                                                                              | `cache.invalidateAll()`                          |
+| `cache.getMetrics().getHitCount()`                                                           | `cache.metrics().hitCount()`                     |
+| `cache.putIfAbsent(k, v)`                                                                    | `cache.computeIfAbsent(k, key -> v)`             |
+| `CacheLoader` 隐式存在                                                                           | `CacheLoader` / `RefreshLoader` 显式传入             |
