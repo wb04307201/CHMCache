@@ -4,6 +4,7 @@ import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ForkJoinPool;
+import java.util.function.LongSupplier;
 import java.util.function.Predicate;
 
 /**
@@ -36,11 +37,14 @@ public final class CHMCacheBuilder<K, V> {
     private Expiry<? super K, ? super V> expiry = null;
     private Duration cleanupInterval = Duration.ofSeconds(1);
     private RemovalListener<? super K, ? super V> removalListener = null;
+    private CacheListener<? super K, ? super V> listener = null;
     private boolean statsEnabled = false;
     private boolean shardedLocks = true;
     private boolean slidingTtl = false;
     private Duration refreshAfterWriteDuration = null;
     private Executor executor = ForkJoinPool.commonPool();
+    private LongSupplier nanoTimeSource = System::nanoTime;
+    private boolean perKeyMetrics = false;
 
     CHMCacheBuilder() {}
 
@@ -56,7 +60,10 @@ public final class CHMCacheBuilder<K, V> {
     public boolean slidingTtl() { return slidingTtl; }
     public Executor executor() { return executor; }
     public RemovalListener<? super K, ? super V> removalListener() { return removalListener; }
+    public CacheListener<? super K, ? super V> listener() { return listener; }
     public Duration refreshAfterWriteDuration() { return refreshAfterWriteDuration; }
+    public LongSupplier nanoTimeSource() { return nanoTimeSource; }
+    public boolean isPerKeyMetrics() { return perKeyMetrics; }
 
     /**
      * 设置缓存实例名称。默认 "default"。
@@ -160,6 +167,17 @@ public final class CHMCacheBuilder<K, V> {
     }
 
     /**
+     * 设置多事件缓存监听器。与 {@link #removalListener} 独立，可同时设置。
+     *
+     * <p>监听器在缓存主路径上同步调用，必须快速且无副作用，否则会拖慢 get/put 性能。
+     * 若需异步处理，请在 listener 内投递到独立 Executor。</p>
+     */
+    public CHMCacheBuilder<K, V> listener(CacheListener<? super K, ? super V> listener) {
+        this.listener = Objects.requireNonNull(listener, "listener");
+        return this;
+    }
+
+    /**
      * 启用详细统计（延迟分布、热点 Key 等开销较高的指标）。
      */
     public CHMCacheBuilder<K, V> recordStats() {
@@ -184,11 +202,58 @@ public final class CHMCacheBuilder<K, V> {
     }
 
     /**
+     * 自定义单调时钟源，用于 TTL / 过期判断。默认 {@link System#nanoTime()}。
+     *
+     * <p>主要用于测试场景：注入一个可控的时钟源可以在单测中"快进"时间，
+     * 避免 {@code Thread.sleep()} 真实等待。生产环境保持默认即可。</p>
+     *
+     * <p>注意：返回的值必须是单调递增的（与 {@link System#nanoTime()} 语义一致），
+     * 否则 TTL 判断会出错。</p>
+     */
+    public CHMCacheBuilder<K, V> nanoTimeSource(LongSupplier nanoTimeSource) {
+        this.nanoTimeSource = Objects.requireNonNull(nanoTimeSource, "nanoTimeSource");
+        return this;
+    }
+
+    /**
+     * 是否启用 per-key 统计。默认 {@code false}。
+     *
+     * <p>启用后 {@link CHMCache#stats(Object)} / {@link CHMCache#allStats()}
+     * 返回真实数据，否则返回空。每个 key 独立累加 hit/miss/put/eviction/expiration
+     * 等计数器，开销较低但高基数 key 集合下内存占用会增长。</p>
+     */
+    public CHMCacheBuilder<K, V> enablePerKeyMetrics(boolean enable) {
+        this.perKeyMetrics = enable;
+        return this;
+    }
+
+    /**
      * 构建缓存实例。
      */
     public CHMCache<K, V> build() {
         validate();
         return new CHMCache<>(this);
+    }
+
+    /**
+     * 构建不可变配置 record。可用于需要显式传递配置、序列化、或传递给
+     * {@link CHMCache#CHMCache(CHMCacheConfig)} 构造器的场景。
+     *
+     * @since 1.1.0
+     */
+    public CHMCacheConfig<K, V> buildConfig() {
+        validate();
+        Eviction resolvedEviction = maximumWeight > 0 ? Evictions.weightBased() : Evictions.sizeBased();
+        Expiration<? super K, ? super V> resolvedExpiration = expiration != null
+                ? expiration
+                : Expirations.afterWrite(Duration.ofNanos(Long.MAX_VALUE / 2));
+        return new CHMCacheConfig<>(
+                name, maximumSize, maximumWeight, weigher,
+                resolvedEviction, resolvedExpiration, expiry,
+                cleanupInterval, removalListener, listener,
+                statsEnabled, shardedLocks, slidingTtl,
+                refreshAfterWriteDuration, executor, nanoTimeSource, perKeyMetrics
+        );
     }
 
     private void validate() {
